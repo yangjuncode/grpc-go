@@ -200,12 +200,12 @@ func (a *csAttempt) recvMsgForward( payInfo *payloadInfo) (mBytes []byte, err er
 	}
 	// Special handling for non-server-stream rpcs.
 	// This recv expects EOF or errors, so we don't collect inPayload.
-	mBytes, err = recvForward(a.p, cs.codec, a.s, a.dc, *cs.callInfo.maxReceiveMessageSize, nil, a.decomp)
+	_, err = recvForward(a.p, cs.codec, a.s, a.dc, *cs.callInfo.maxReceiveMessageSize, nil, a.decomp)
 	if err == nil {
 		return nil, toRPCErr(errors.New("grpc: client streaming protocol violation: get <nil>, want <EOF>"))
 	}
 	if err == io.EOF {
-		return nil, a.s.Status().Err() // non-server streaming Recv returns nil on success
+		return mBytes, a.s.Status().Err() // non-server streaming Recv returns nil on success
 	}
 	return mBytes, toRPCErr(err)
 }
@@ -213,7 +213,7 @@ func (a *csAttempt) recvMsgForward( payInfo *payloadInfo) (mBytes []byte, err er
 func (cc *ClientConn) InvokeForward(ctx context.Context, method string, args []byte, opts ...CallOption) (reply []byte, err error) {
 	// allow interceptor to see all applicable call options, which means those
 	// configured as defaults from dial option as well as per-call options
-	//opts = combine(cc.dopts.callOptions, opts)
+	opts = combine(cc.dopts.callOptions, opts)
 
 	//if cc.dopts.unaryInt != nil {
 	//	return cc.dopts.unaryInt(ctx, method, args, reply, cc, invoke, opts...)
