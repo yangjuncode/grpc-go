@@ -138,7 +138,7 @@ func (xdsB *EDSBalancer) updateDrops(dropPolicies []*edspb.ClusterLoadAssignment
 		case percentpb.FractionalPercent_MILLION:
 			denominator = 1000000
 		}
-		newDrops = append(newDrops, newDropper(numerator, denominator))
+		newDrops = append(newDrops, newDropper(numerator, denominator, dropPolicy.GetCategory()))
 
 		// The following reading xdsB.drops doesn't need mutex because it can only
 		// be updated by the code following.
@@ -292,13 +292,10 @@ func newDropPicker(p balancer.Picker, drops []*dropper) *dropPicker {
 func (d *dropPicker) Pick(ctx context.Context, opts balancer.PickOptions) (conn balancer.SubConn, done func(balancer.DoneInfo), err error) {
 	var drop bool
 	for _, dp := range d.drops {
-		// It's necessary to call drop on all droppers if the droppers are
-		// stateful. For example, if the second drop only drops 1/2, and only
-		// drops even number picks, we need to call it's drop() even if the
-		// first dropper already returned true.
-		//
-		// It won't be necessary if droppers are stateless, like toss a coin.
-		drop = drop || dp.drop()
+		if dp.drop() {
+			drop = true
+			break
+		}
 	}
 	if drop {
 		return nil, nil, status.Errorf(codes.Unavailable, "RPC is dropped")
