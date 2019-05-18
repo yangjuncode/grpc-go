@@ -293,6 +293,7 @@ func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *
 		CredsBundle:      cc.dopts.copts.CredsBundle,
 		Dialer:           cc.dopts.copts.Dialer,
 		ChannelzParentID: cc.channelzID,
+		Target:           cc.parsedTarget,
 	}
 
 	// Build the resolver.
@@ -602,6 +603,7 @@ func (cc *ClientConn) updateResolverState(s resolver.State) error {
 	} else if cc.balancerWrapper == nil {
 		// Balancer dial option was set, and this is the first time handling
 		// resolved addresses. Build a balancer with dopts.balancerBuilder.
+		cc.curBalancerName = cc.dopts.balancerBuilder.Name()
 		cc.balancerWrapper = newCCBalancerWrapper(cc, cc.dopts.balancerBuilder, cc.balancerBuildOpts)
 	}
 
