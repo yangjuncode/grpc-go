@@ -661,23 +661,18 @@ func (te *test) listenAndServe(ts testpb.TestServiceServer, listen func(network,
 		}
 		cert, err := tls.LoadX509KeyPair(testdata.Path("server1.pem"), testdata.Path("server1.key"))
 		if err != nil {
-			te.t.Fatal("Error creating TLS certificate: ", err)
+			te.t.Fatal("tls.LoadX509KeyPair(server1.pem, server1.key) failed: ", err)
 		}
 		hs := &http.Server{
-			Handler: s,
+			Handler:   s,
+			TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}},
 		}
-		err = http2.ConfigureServer(hs, &http2.Server{
-			MaxConcurrentStreams: te.maxStream,
-		})
-		if err != nil {
-			te.t.Fatal("error starting http2 server: ", err)
+		if err := http2.ConfigureServer(hs, &http2.Server{MaxConcurrentStreams: te.maxStream}); err != nil {
+			te.t.Fatal("http2.ConfigureServer(_, _) failed: ", err)
 		}
-		hs.TLSConfig.Certificates = []tls.Certificate{cert}
+		te.srv = wrapHS{hs}
 		tlsListener := tls.NewListener(lis, hs.TLSConfig)
-		whs := &wrapHS{Listener: tlsListener, s: hs, conns: make(map[net.Conn]bool)}
-		te.srv = whs
-		go hs.Serve(whs)
-
+		go hs.Serve(tlsListener)
 		return lis
 	}
 
@@ -685,66 +680,16 @@ func (te *test) listenAndServe(ts testpb.TestServiceServer, listen func(network,
 	return lis
 }
 
-// TODO: delete wrapHS and wrapConn when Go1.6 and Go1.7 support are gone and
-// call s.Close and s.Shutdown instead.
 type wrapHS struct {
-	sync.Mutex
-	net.Listener
-	s     *http.Server
-	conns map[net.Conn]bool
+	s *http.Server
 }
 
-func (w *wrapHS) Accept() (net.Conn, error) {
-	c, err := w.Listener.Accept()
-	if err != nil {
-		return nil, err
-	}
-	w.Lock()
-	if w.conns == nil {
-		w.Unlock()
-		c.Close()
-		return nil, errors.New("connection after listener closed")
-	}
-	w.conns[&wrapConn{Conn: c, hs: w}] = true
-	w.Unlock()
-	return c, nil
+func (w wrapHS) GracefulStop() {
+	w.s.Shutdown(context.Background())
 }
 
-func (w *wrapHS) Stop() {
-	w.Listener.Close()
-	w.Lock()
-	conns := w.conns
-	w.conns = nil
-	w.Unlock()
-	for c := range conns {
-		c.Close()
-	}
-}
-
-// Poll for now..
-func (w *wrapHS) GracefulStop() {
-	w.Listener.Close()
-	for {
-		w.Lock()
-		l := len(w.conns)
-		w.Unlock()
-		if l == 0 {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-}
-
-type wrapConn struct {
-	net.Conn
-	hs *wrapHS
-}
-
-func (w *wrapConn) Close() error {
-	w.hs.Lock()
-	delete(w.hs.conns, w.Conn)
-	w.hs.Unlock()
-	return w.Conn.Close()
+func (w wrapHS) Stop() {
+	w.s.Close()
 }
 
 func (te *test) startServerWithConnControl(ts testpb.TestServiceServer) *listenerWrapper {
@@ -2496,7 +2441,7 @@ func testHealthCheckOnFailure(t *testing.T, e env) {
 
 	cc := te.clientConn()
 	wantErr := status.Error(codes.DeadlineExceeded, "context deadline exceeded")
-	if _, err := healthCheck(0*time.Second, cc, "grpc.health.v1.Health"); !reflect.DeepEqual(err, wantErr) {
+	if _, err := healthCheck(0*time.Second, cc, "grpc.health.v1.Health"); !testutils.StatusErrEqual(err, wantErr) {
 		t.Fatalf("Health/Check(_, _) = _, %v, want _, error code %s", err, codes.DeadlineExceeded)
 	}
 	awaitNewConnLogOutput()
@@ -2517,7 +2462,7 @@ func testHealthCheckOff(t *testing.T, e env) {
 	te.startServer(&testServer{security: e.security})
 	defer te.tearDown()
 	want := status.Error(codes.Unimplemented, "unknown service grpc.health.v1.Health")
-	if _, err := healthCheck(1*time.Second, te.clientConn(), ""); !reflect.DeepEqual(err, want) {
+	if _, err := healthCheck(1*time.Second, te.clientConn(), ""); !testutils.StatusErrEqual(err, want) {
 		t.Fatalf("Health/Check(_, _) = _, %v, want _, %v", err, want)
 	}
 }
@@ -2791,7 +2736,7 @@ func testUnknownHandler(t *testing.T, e env, unknownHandler grpc.StreamHandler) 
 	te.startServer(&testServer{security: e.security})
 	defer te.tearDown()
 	want := status.Error(codes.Unauthenticated, "user unauthenticated")
-	if _, err := healthCheck(1*time.Second, te.clientConn(), ""); !reflect.DeepEqual(err, want) {
+	if _, err := healthCheck(1*time.Second, te.clientConn(), ""); !testutils.StatusErrEqual(err, want) {
 		t.Fatalf("Health/Check(_, _) = _, %v, want _, %v", err, want)
 	}
 }
@@ -2818,7 +2763,7 @@ func testHealthCheckServingStatus(t *testing.T, e env) {
 		t.Fatalf("Got the serving status %v, want SERVING", out.Status)
 	}
 	wantErr := status.Error(codes.NotFound, "unknown service")
-	if _, err := healthCheck(1*time.Second, cc, "grpc.health.v1.Health"); !reflect.DeepEqual(err, wantErr) {
+	if _, err := healthCheck(1*time.Second, cc, "grpc.health.v1.Health"); !testutils.StatusErrEqual(err, wantErr) {
 		t.Fatalf("Health/Check(_, _) = _, %v, want _, error code %s", err, codes.NotFound)
 	}
 	hs.SetServingStatus("grpc.health.v1.Health", healthpb.HealthCheckResponse_SERVING)
@@ -2886,7 +2831,7 @@ func testFailedEmptyUnary(t *testing.T, e env) {
 
 	ctx := metadata.NewOutgoingContext(context.Background(), testMetadata)
 	wantErr := detailedError
-	if _, err := tc.EmptyCall(ctx, &testpb.Empty{}); !reflect.DeepEqual(err, wantErr) {
+	if _, err := tc.EmptyCall(ctx, &testpb.Empty{}); !testutils.StatusErrEqual(err, wantErr) {
 		t.Fatalf("TestService/EmptyCall(_, _) = _, %v, want _, %v", err, wantErr)
 	}
 }
@@ -3535,7 +3480,7 @@ func testMultipleSetHeaderStreamingRPCError(t *testing.T, e env) {
 	}
 }
 
-// TestMalformedHTTP2Metedata verfies the returned error when the client
+// TestMalformedHTTP2Metadata verfies the returned error when the client
 // sends an illegal metadata.
 func (s) TestMalformedHTTP2Metadata(t *testing.T) {
 	for _, e := range listTestEnv() {
@@ -5237,6 +5182,7 @@ type stubServer struct {
 	// A client connected to this service the test may use.  Created in Start().
 	client testpb.TestServiceClient
 	cc     *grpc.ClientConn
+	s      *grpc.Server
 
 	addr string // address of listener
 
@@ -5274,6 +5220,7 @@ func (ss *stubServer) Start(sopts []grpc.ServerOption, dopts ...grpc.DialOption)
 	testpb.RegisterTestServiceServer(s, ss)
 	go s.Serve(lis)
 	ss.cleanups = append(ss.cleanups, s.Stop)
+	ss.s = s
 
 	target := ss.r.Scheme() + ":///" + ss.addr
 
@@ -7163,6 +7110,11 @@ func (s) TestGoAwayThenClose(t *testing.T) {
 		t.Fatal("expected the stream to die, but got a successful Recv")
 	}
 
+	// Connection was dialed, so ac is either in connecting or ready. Because there's a race
+	// between ac state change and balancer state change, so cc could still be transient
+	// failure. This wait make sure cc is at least in connecting, and RPCs won't fail after
+	// this.
+	cc.WaitForStateChange(ctx, connectivity.TransientFailure)
 	// Do a bunch of RPCs, make sure it stays stable. These should go to connection 2.
 	for i := 0; i < 10; i++ {
 		if _, err := client.UnaryCall(ctx, &testpb.SimpleRequest{}); err != nil {
@@ -7434,6 +7386,7 @@ func (s *httpServer) start(t *testing.T, lis net.Listener) {
 }
 
 func doHTTPHeaderTest(t *testing.T, errCode codes.Code, headerFields ...[]string) {
+	t.Helper()
 	lis, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		t.Fatalf("Failed to listen. Err: %v", err)
@@ -7443,13 +7396,13 @@ func doHTTPHeaderTest(t *testing.T, errCode codes.Code, headerFields ...[]string
 		headerFields: headerFields,
 	}
 	server.start(t, lis)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	cc, err := grpc.DialContext(ctx, lis.Addr().String(), grpc.WithInsecure())
+	cc, err := grpc.Dial(lis.Addr().String(), grpc.WithInsecure())
 	if err != nil {
 		t.Fatalf("failed to dial due to err: %v", err)
 	}
 	defer cc.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 	client := testpb.NewTestServiceClient(cc)
 	stream, err := client.FullDuplexCall(ctx)
 	if err != nil {
