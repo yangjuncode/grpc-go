@@ -48,12 +48,6 @@ const (
 	endpointRequired = "endpoints_required"
 )
 
-var (
-	defaultBackoffConfig = backoff.Exponential{
-		MaxDelay: 120 * time.Second,
-	}
-)
-
 // client is responsible for connecting to the specified traffic director, passing the received
 // ADS response from the traffic director, and sending notification when communication with the
 // traffic director is lost.
@@ -266,35 +260,23 @@ func newXDSClient(balancerName string, enableCDS bool, opts balancer.BuildOption
 		newADS:           newADS,
 		loseContact:      loseContact,
 		cleanup:          exitCleanup,
-		backoff:          defaultBackoffConfig,
+		backoff:          backoff.DefaultExponential,
 		loadStore:        loadStore,
 	}
 
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 
-	var err error
-	if c.config, err = xdsclient.NewConfig(); err != nil {
-		grpclog.Error(err)
-		c.config = newConfigFromDefaults(balancerName, &opts)
+	// It is possible that NewConfig returns a Config object with certain
+	// fields left unspecified. If so, we need to use some sane defaults here.
+	c.config = xdsclient.NewConfig()
+	if c.config.BalancerName == "" {
+		c.config.BalancerName = balancerName
 	}
-	return c
-}
-
-func newConfigFromDefaults(balancerName string, opts *balancer.BuildOptions) *xdsclient.Config {
-	dopts := grpc.WithInsecure()
-	if opts.DialCreds != nil {
-		if err := opts.DialCreds.OverrideServerName(balancerName); err == nil {
-			dopts = grpc.WithTransportCredentials(opts.DialCreds)
-		} else {
-			grpclog.Warningf("xds: failed to override the server name in credentials: %v, using Insecure", err)
-		}
-	} else {
-		grpclog.Warning("xds: no credentials available, using Insecure")
+	if c.config.Creds == nil {
+		c.config.Creds = credsFromDefaults(balancerName, &opts)
 	}
-	return &xdsclient.Config{
-		BalancerName: balancerName,
-		Creds:        dopts,
-		NodeProto: &basepb.Node{
+	if c.config.NodeProto == nil {
+		c.config.NodeProto = &basepb.Node{
 			Metadata: &structpb.Struct{
 				Fields: map[string]*structpb.Value{
 					internal.GrpcHostname: {
@@ -302,6 +284,19 @@ func newConfigFromDefaults(balancerName string, opts *balancer.BuildOptions) *xd
 					},
 				},
 			},
-		},
+		}
 	}
+	return c
+}
+
+func credsFromDefaults(balancerName string, opts *balancer.BuildOptions) grpc.DialOption {
+	if opts.DialCreds == nil {
+		grpclog.Warning("xds: no credentials available, using Insecure")
+		return grpc.WithInsecure()
+	}
+	if err := opts.DialCreds.OverrideServerName(balancerName); err != nil {
+		grpclog.Warningf("xds: failed to override the server name in credentials: %v, using Insecure", err)
+		return grpc.WithInsecure()
+	}
+	return grpc.WithTransportCredentials(opts.DialCreds)
 }

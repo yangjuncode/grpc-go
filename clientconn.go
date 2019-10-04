@@ -235,9 +235,7 @@ func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *
 		}
 	}
 	if cc.dopts.bs == nil {
-		cc.dopts.bs = backoff.Exponential{
-			MaxDelay: DefaultBackoffConfig.MaxDelay,
-		}
+		cc.dopts.bs = backoff.DefaultExponential
 	}
 	if cc.dopts.resolverBuilder == nil {
 		// Only try to parse target when resolver builder is not already set.
@@ -875,8 +873,9 @@ func (cc *ClientConn) resolveNow(o resolver.ResolveNowOption) {
 // This API is EXPERIMENTAL.
 func (cc *ClientConn) ResetConnectBackoff() {
 	cc.mu.Lock()
-	defer cc.mu.Unlock()
-	for ac := range cc.conns {
+	conns := cc.conns
+	cc.mu.Unlock()
+	for ac := range conns {
 		ac.resetConnectBackoff()
 	}
 }
@@ -1331,7 +1330,7 @@ func (ac *addrConn) tearDown(err error) {
 	curTr := ac.transport
 	ac.transport = nil
 	// We have to set the state to Shutdown before anything else to prevent races
-	// between setting the state and logic that waits on context cancelation / etc.
+	// between setting the state and logic that waits on context cancellation / etc.
 	ac.updateConnectivityState(connectivity.Shutdown)
 	ac.cancel()
 	ac.curAddr = resolver.Address{}
@@ -1355,7 +1354,7 @@ func (ac *addrConn) tearDown(err error) {
 			},
 		})
 		// TraceEvent needs to be called before RemoveEntry, as TraceEvent may add trace reference to
-		// the entity beng deleted, and thus prevent it from being deleted right away.
+		// the entity being deleted, and thus prevent it from being deleted right away.
 		channelz.RemoveEntry(ac.channelzID)
 	}
 	ac.mu.Unlock()
