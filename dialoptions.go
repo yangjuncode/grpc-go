@@ -69,6 +69,10 @@ type dialOptions struct {
 	minConnectTimeout           func() time.Duration
 	defaultServiceConfig        *ServiceConfig // defaultServiceConfig is parsed from defaultServiceConfigRawJSON.
 	defaultServiceConfigRawJSON *string
+	// This is used by ccResolverWrapper to backoff between successive calls to
+	// resolver.ResolveNow(). The user will have no need to configure this, but
+	// we need to be able to configure this in tests.
+	resolveNowBackoff func(int) time.Duration
 }
 
 // DialOption configures how we set up the connection.
@@ -342,8 +346,8 @@ func WithCredentialsBundle(b credentials.Bundle) DialOption {
 // WithTimeout returns a DialOption that configures a timeout for dialing a
 // ClientConn initially. This is valid if and only if WithBlock() is present.
 //
-// Deprecated: use DialContext and context.WithTimeout instead.  Will be
-// supported throughout 1.x.
+// Deprecated: use DialContext instead of Dial and context.WithTimeout
+// instead.  Will be supported throughout 1.x.
 func WithTimeout(d time.Duration) DialOption {
 	return newFuncDialOption(func(o *dialOptions) {
 		o.timeout = d
@@ -475,6 +479,8 @@ func WithAuthority(a string) DialOption {
 // WithChannelzParentID returns a DialOption that specifies the channelz ID of
 // current ClientConn's parent. This function is used in nested channel creation
 // (e.g. grpclb dial).
+//
+// This API is EXPERIMENTAL.
 func WithChannelzParentID(id int64) DialOption {
 	return newFuncDialOption(func(o *dialOptions) {
 		o.channelzParentID = id
@@ -559,6 +565,7 @@ func defaultDialOptions() dialOptions {
 			WriteBufferSize: defaultWriteBufSize,
 			ReadBufferSize:  defaultReadBufSize,
 		},
+		resolveNowBackoff: internalbackoff.DefaultExponential.Backoff,
 	}
 }
 
@@ -570,5 +577,15 @@ func defaultDialOptions() dialOptions {
 func withMinConnectDeadline(f func() time.Duration) DialOption {
 	return newFuncDialOption(func(o *dialOptions) {
 		o.minConnectTimeout = f
+	})
+}
+
+// withResolveNowBackoff specifies the function that clientconn uses to backoff
+// between successive calls to resolver.ResolveNow().
+//
+// For testing purpose only.
+func withResolveNowBackoff(f func(int) time.Duration) DialOption {
+	return newFuncDialOption(func(o *dialOptions) {
+		o.resolveNowBackoff = f
 	})
 }

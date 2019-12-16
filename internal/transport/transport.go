@@ -73,10 +73,11 @@ type recvMsg struct {
 }
 
 // recvBuffer is an unbounded channel of recvMsg structs.
-// Note recvBuffer differs from controlBuffer only in that recvBuffer
-// holds a channel of only recvMsg structs instead of objects implementing "item" interface.
-// recvBuffer is written to much more often than
-// controlBuffer and using strict recvMsg structs helps avoid allocation in "recvBuffer.put"
+//
+// Note: recvBuffer differs from buffer.Unbounded only in the fact that it
+// holds a channel of recvMsg structs instead of objects implementing "item"
+// interface. recvBuffer is written to much more often and using strict recvMsg
+// structs helps avoid allocation in "recvBuffer.put"
 type recvBuffer struct {
 	c       chan recvMsg
 	mu      sync.Mutex
@@ -318,8 +319,7 @@ func (s *Stream) waitOnHeader() {
 	case <-s.ctx.Done():
 		// Close the stream to prevent headers/trailers from changing after
 		// this function returns.
-		err := ContextErr(s.ctx.Err())
-		s.ct.closeStream(s, err, false, 0, status.Convert(err), nil, false)
+		s.ct.CloseStream(s, ContextErr(s.ctx.Err()))
 		// headerChan could possibly not be closed yet if closeStream raced
 		// with operateHeaders; wait until it is closed explicitly here.
 		<-s.headerChan
