@@ -17,7 +17,7 @@ import (
 )
 
 func recvForward(p *parser, c baseCodec, s *transport.Stream, dc Decompressor, maxReceiveMessageSize int, payInfo *payloadInfo, compressor encoding.Compressor) (msgBytes []byte, err error) {
-	d, err := recvAndDecompress(p, s, dc, maxReceiveMessageSize, payInfo, compressor)
+	d, err := recvAndDecompress(p, s, dc, maxReceiveMessageSize, payInfo, compressor, s.Stat())
 	if err != nil {
 		return nil, err
 	}
@@ -49,7 +49,7 @@ func (cs *clientStream) SendMsgForward(mBytes []byte) (err error) {
 		cs.sentLast = true
 	}
 	data := mBytes
-	compData, err := compress(data, cs.cp, cs.comp)
+	compData, err := compress(data, cs.cp, cs.comp, nil)
 	if err != nil {
 		return err
 	}
@@ -75,7 +75,7 @@ func (cs *clientStream) SendMsgForward(mBytes []byte) (err error) {
 	}
 	return
 }
-func (cs *clientStream) RecvMsgForward()(mBytes []byte, err error) {
+func (cs *clientStream) RecvMsgForward() (mBytes []byte, err error) {
 	if cs.binlog != nil && !cs.serverHeaderBinlogged {
 		// Call Header() to binary log header if it's not already logged.
 		cs.Header()
@@ -84,8 +84,8 @@ func (cs *clientStream) RecvMsgForward()(mBytes []byte, err error) {
 	if cs.binlog != nil {
 		recvInfo = &payloadInfo{}
 	}
-	mBytes,err = cs.withRetryForward(func(a *csAttempt)([]byte, error) {
-		return a.recvMsgForward( recvInfo)
+	mBytes, err = cs.withRetryForward(func(a *csAttempt) ([]byte, error) {
+		return a.recvMsgForward(recvInfo)
 	}, cs.commitAttemptLocked)
 	if cs.binlog != nil && err == nil {
 		cs.binlog.Log(&binarylog.ServerMessage{
@@ -113,7 +113,7 @@ func (cs *clientStream) RecvMsgForward()(mBytes []byte, err error) {
 			cs.binlog.Log(logEntry)
 		}
 	}
-	return mBytes,err
+	return mBytes, err
 }
 func (a *csAttempt) sendMsgForward(mBytes []byte, hdr, payld, data []byte) error {
 	cs := a.cs
@@ -124,7 +124,7 @@ func (a *csAttempt) sendMsgForward(mBytes []byte, hdr, payld, data []byte) error
 		}
 		a.mu.Unlock()
 	}
-	if err := a.t.Write(a.s, hdr, payld, &transport.Options{Last: !cs.desc.ClientStreams}); err != nil {
+	if err := a.t.Write(a.s, hdr, payld, a.s.Stat(), &transport.Options{Last: !cs.desc.ClientStreams}); err != nil {
 		if !cs.desc.ClientStreams {
 			// For non-client-streaming RPCs, we return nil instead of EOF on error
 			// because the generated code requires it.  finish is not called; RecvMsg()
@@ -141,7 +141,7 @@ func (a *csAttempt) sendMsgForward(mBytes []byte, hdr, payld, data []byte) error
 	}
 	return nil
 }
-func (a *csAttempt) recvMsgForward( payInfo *payloadInfo) (mBytes []byte, err error) {
+func (a *csAttempt) recvMsgForward(payInfo *payloadInfo) (mBytes []byte, err error) {
 	cs := a.cs
 	if a.statsHandler != nil && payInfo == nil {
 		payInfo = &payloadInfo{}
@@ -249,8 +249,8 @@ func (as *addrConnStream) SendMsgForward(mBytes []byte) (err error) {
 	if !as.desc.ClientStreams {
 		as.sentLast = true
 	}
-	data :=mBytes
-	compData, err := compress(data, as.cp, as.comp)
+	data := mBytes
+	compData, err := compress(data, as.cp, as.comp, nil)
 	if err != nil {
 		return err
 	}
@@ -260,7 +260,7 @@ func (as *addrConnStream) SendMsgForward(mBytes []byte) (err error) {
 		return status.Errorf(codes.ResourceExhausted, "trying to send message larger than max (%d vs. %d)", len(payld), *as.callInfo.maxSendMessageSize)
 	}
 
-	if err := as.t.Write(as.s, hdr, payld, &transport.Options{Last: !as.desc.ClientStreams}); err != nil {
+	if err := as.t.Write(as.s, hdr, payld, as.s.Stat(), &transport.Options{Last: !as.desc.ClientStreams}); err != nil {
 		if !as.desc.ClientStreams {
 			// For non-client-streaming RPCs, we return nil instead of EOF on error
 			// because the generated code requires it.  finish is not called; RecvMsg()
@@ -276,7 +276,7 @@ func (as *addrConnStream) SendMsgForward(mBytes []byte) (err error) {
 	return nil
 }
 
-func (as *addrConnStream) RecvMsgForward() (mBytes []byte ,err error) {
+func (as *addrConnStream) RecvMsgForward() (mBytes []byte, err error) {
 	defer func() {
 		if err != nil || !as.desc.ServerStreams {
 			// err != nil or non-server-streaming indicates end of stream.
@@ -300,15 +300,15 @@ func (as *addrConnStream) RecvMsgForward() (mBytes []byte ,err error) {
 		// Only initialize this state once per stream.
 		as.decompSet = true
 	}
-	mBytes,err = recvForward(as.p, as.codec, as.s, as.dc,  *as.callInfo.maxReceiveMessageSize, nil, as.decomp)
+	mBytes, err = recvForward(as.p, as.codec, as.s, as.dc, *as.callInfo.maxReceiveMessageSize, nil, as.decomp)
 	if err != nil {
 		if err == io.EOF {
 			if statusErr := as.s.Status().Err(); statusErr != nil {
-				return mBytes,statusErr
+				return mBytes, statusErr
 			}
-			return mBytes,io.EOF // indicates successful end of stream.
+			return mBytes, io.EOF // indicates successful end of stream.
 		}
-		return mBytes,toRPCErr(err)
+		return mBytes, toRPCErr(err)
 	}
 
 	if channelz.IsOn() {
@@ -316,22 +316,22 @@ func (as *addrConnStream) RecvMsgForward() (mBytes []byte ,err error) {
 	}
 	if as.desc.ServerStreams {
 		// Subsequent messages should be received by subsequent RecvMsg calls.
-		return mBytes,nil
+		return mBytes, nil
 	}
 
 	// Special handling for non-server-stream rpcs.
 	// This recv expects EOF or errors, so we don't collect inPayload.
-	mBytes,err = recvForward(as.p, as.codec, as.s, as.dc,  *as.callInfo.maxReceiveMessageSize, nil, as.decomp)
+	mBytes, err = recvForward(as.p, as.codec, as.s, as.dc, *as.callInfo.maxReceiveMessageSize, nil, as.decomp)
 	if err == nil {
-		return mBytes,toRPCErr(errors.New("grpc: client streaming protocol violation: get <nil>, want <EOF>"))
+		return mBytes, toRPCErr(errors.New("grpc: client streaming protocol violation: get <nil>, want <EOF>"))
 	}
 	if err == io.EOF {
-		return mBytes,as.s.Status().Err() // non-server streaming Recv returns nil on success
+		return mBytes, as.s.Status().Err() // non-server streaming Recv returns nil on success
 	}
-	return mBytes,toRPCErr(err)
+	return mBytes, toRPCErr(err)
 }
 
-func (cs *clientStream) withRetryForward(op func(a *csAttempt) ([]byte,error), onSuccess func())([]byte, error) {
+func (cs *clientStream) withRetryForward(op func(a *csAttempt) ([]byte, error), onSuccess func()) ([]byte, error) {
 	cs.mu.Lock()
 	for {
 		if cs.committed {
@@ -340,7 +340,7 @@ func (cs *clientStream) withRetryForward(op func(a *csAttempt) ([]byte,error), o
 		}
 		a := cs.attempt
 		cs.mu.Unlock()
-		data,err := op(a)
+		data, err := op(a)
 		cs.mu.Lock()
 		if a != cs.attempt {
 			// We started another attempt already.
@@ -352,11 +352,11 @@ func (cs *clientStream) withRetryForward(op func(a *csAttempt) ([]byte,error), o
 		if err == nil || (err == io.EOF && a.s.Status().Code() == codes.OK) {
 			onSuccess()
 			cs.mu.Unlock()
-			return data,err
+			return data, err
 		}
 		if err := cs.retryLocked(err); err != nil {
 			cs.mu.Unlock()
-			return data,err
+			return data, err
 		}
 	}
 }
