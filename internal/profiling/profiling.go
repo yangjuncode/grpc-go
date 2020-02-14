@@ -33,6 +33,7 @@
 package profiling
 
 import (
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -198,13 +199,15 @@ const defaultStreamStatsSize uint32 = 16 << 10
 // client in its Tags).
 var StreamStats *buffer.CircularBuffer
 
+var errAlreadyInitialized = errors.New("profiling may be initialized at most once")
+
 // InitStats initializes all the relevant Stat objects. Must be called exactly
-// once per lifetime of a process; calls after the first one are ignored.
+// once per lifetime of a process; calls after the first one will return an
+// error.
 func InitStats(streamStatsSize uint32) error {
 	var err error
 	if !atomic.CompareAndSwapInt32(&statsInitialized, 0, 1) {
-		// If initialized, do nothing.
-		return nil
+		return errAlreadyInitialized
 	}
 
 	if streamStatsSize == 0 {
@@ -218,3 +221,12 @@ func InitStats(streamStatsSize uint32) error {
 
 	return nil
 }
+
+const (
+	// StreamStatMetadataConnectionIDSize is the number of bytes reserved for the
+	// connection ID in a stream stat's metadata field.
+	StreamStatMetadataConnectionIDSize = 8
+	// StreamStatMetadataStreamIDSize is the number of bytes reserved for the
+	// stream ID in a stream stat's metadata field.
+	StreamStatMetadataStreamIDSize = 4
+)

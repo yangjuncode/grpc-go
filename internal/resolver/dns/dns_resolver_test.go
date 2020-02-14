@@ -25,10 +25,12 @@ import (
 	"net"
 	"os"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/internal/envconfig"
 	"google.golang.org/grpc/internal/leakcheck"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/serviceconfig"
@@ -53,6 +55,7 @@ type testClientConn struct {
 	m1                  sync.Mutex
 	state               resolver.State
 	updateStateCalls    int
+	errChan             chan error
 }
 
 func (t *testClientConn) UpdateState(s resolver.State) {
@@ -87,8 +90,8 @@ func (t *testClientConn) ParseServiceConfig(s string) *serviceconfig.ParseResult
 	return &serviceconfig.ParseResult{Config: unparsedServiceConfig{config: s}}
 }
 
-func (t *testClientConn) ReportError(error) {
-	panic("not implemented")
+func (t *testClientConn) ReportError(err error) {
+	t.errChan <- err
 }
 
 type testResolver struct {
@@ -139,6 +142,9 @@ var hostLookupTbl = struct {
 		"foo.bar.com":          {"1.2.3.4", "5.6.7.8"},
 		"ipv4.single.fake":     {"1.2.3.4"},
 		"srv.ipv4.single.fake": {"2.4.6.8"},
+		"srv.ipv4.multi.fake":  {},
+		"srv.ipv6.single.fake": {},
+		"srv.ipv6.multi.fake":  {},
 		"ipv4.multi.fake":      {"1.2.3.4", "5.6.7.8", "9.10.11.12"},
 		"ipv6.single.fake":     {"2607:f8b0:400a:801::1001"},
 		"ipv6.multi.fake":      {"2607:f8b0:400a:801::1001", "2607:f8b0:400a:801::1002", "2607:f8b0:400a:801::1003"},
@@ -148,10 +154,15 @@ var hostLookupTbl = struct {
 func hostLookup(host string) ([]string, error) {
 	hostLookupTbl.Lock()
 	defer hostLookupTbl.Unlock()
-	if addrs, cnt := hostLookupTbl.tbl[host]; cnt {
+	if addrs, ok := hostLookupTbl.tbl[host]; ok {
 		return addrs, nil
 	}
-	return nil, fmt.Errorf("failed to lookup host:%s resolution in hostLookupTbl", host)
+	return nil, &net.DNSError{
+		Err:         "hostLookup error",
+		Name:        host,
+		Server:      "fake",
+		IsTemporary: true,
+	}
 }
 
 var srvLookupTbl = struct {
@@ -173,7 +184,12 @@ func srvLookup(service, proto, name string) (string, []*net.SRV, error) {
 	if srvs, cnt := srvLookupTbl.tbl[cname]; cnt {
 		return cname, srvs, nil
 	}
-	return "", nil, fmt.Errorf("failed to lookup srv record for %s in srvLookupTbl", cname)
+	return "", nil, &net.DNSError{
+		Err:         "srvLookup error",
+		Name:        cname,
+		Server:      "fake",
+		IsTemporary: true,
+	}
 }
 
 // scfs contains an array of service config file string in JSON format.
@@ -635,7 +651,12 @@ func txtLookup(host string) ([]string, error) {
 	if scs, cnt := txtLookupTbl.tbl[host]; cnt {
 		return scs, nil
 	}
-	return nil, fmt.Errorf("failed to lookup TXT:%s resolution in txtLookupTbl", host)
+	return nil, &net.DNSError{
+		Err:         "txtLookup error",
+		Name:        host,
+		Server:      "fake",
+		IsTemporary: true,
+	}
 }
 
 func TestResolve(t *testing.T) {
@@ -810,7 +831,11 @@ func mutateTbl(target string) func() {
 		hostLookupTbl.tbl[target] = oldHostTblEntry
 		hostLookupTbl.Unlock()
 		txtLookupTbl.Lock()
-		txtLookupTbl.tbl[txtPrefix+target] = oldTxtTblEntry
+		if len(oldTxtTblEntry) == 0 {
+			delete(txtLookupTbl.tbl, txtPrefix+target)
+		} else {
+			txtLookupTbl.tbl[txtPrefix+target] = oldTxtTblEntry
+		}
 		txtLookupTbl.Unlock()
 	}
 }
@@ -962,7 +987,7 @@ func TestResolveFunc(t *testing.T) {
 
 	b := NewBuilder()
 	for _, v := range tests {
-		cc := &testClientConn{target: v.addr}
+		cc := &testClientConn{target: v.addr, errChan: make(chan error, 1)}
 		r, err := b.Build(resolver.Target{Endpoint: v.addr}, cc, resolver.BuildOptions{})
 		if err == nil {
 			r.Close()
@@ -1015,6 +1040,38 @@ func TestDisableServiceConfig(t *testing.T) {
 		sc := scFromState(state)
 		if a.scWant != sc {
 			t.Errorf("Resolved service config of target: %q = %+v, want %+v\n", a.target, sc, a.scWant)
+		}
+	}
+}
+
+func TestTXTError(t *testing.T) {
+	defer leakcheck.Check(t)
+	defer func(v bool) { envconfig.TXTErrIgnore = v }(envconfig.TXTErrIgnore)
+	for _, ignore := range []bool{false, true} {
+		envconfig.TXTErrIgnore = ignore
+		b := NewBuilder()
+		cc := &testClientConn{target: "ipv4.single.fake"} // has A records but not TXT records.
+		r, err := b.Build(resolver.Target{Endpoint: "ipv4.single.fake"}, cc, resolver.BuildOptions{})
+		if err != nil {
+			t.Fatalf("%v\n", err)
+		}
+		defer r.Close()
+		var cnt int
+		var state resolver.State
+		for i := 0; i < 2000; i++ {
+			state, cnt = cc.getState()
+			if cnt > 0 {
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+		if cnt == 0 {
+			t.Fatalf("UpdateState not called after 2s; aborting")
+		}
+		if !ignore && (state.ServiceConfig == nil || state.ServiceConfig.Err == nil) {
+			t.Errorf("state.ServiceConfig = %v; want non-nil error", state.ServiceConfig)
+		} else if ignore && state.ServiceConfig != nil {
+			t.Errorf("state.ServiceConfig = %v; want nil", state.ServiceConfig)
 		}
 	}
 }
@@ -1155,7 +1212,7 @@ func TestCustomAuthority(t *testing.T) {
 		}
 
 		b := NewBuilder()
-		cc := &testClientConn{target: "foo.bar.com"}
+		cc := &testClientConn{target: "foo.bar.com", errChan: make(chan error, 1)}
 		r, err := b.Build(resolver.Target{Endpoint: "foo.bar.com", Authority: a.authority}, cc, resolver.BuildOptions{})
 
 		if err == nil {
@@ -1182,18 +1239,19 @@ func TestCustomAuthority(t *testing.T) {
 func TestRateLimitedResolve(t *testing.T) {
 	defer leakcheck.Check(t)
 
-	const dnsResRate = 100 * time.Millisecond
+	const dnsResRate = 10 * time.Millisecond
 	dc := replaceDNSResRate(dnsResRate)
 	defer dc()
 
 	// Create a new testResolver{} for this test because we want the exact count
 	// of the number of times the resolver was invoked.
-	nc := replaceNetFunc(make(chan struct{}, 1))
+	nc := replaceNetFunc(make(chan struct{}))
 	defer nc()
 
 	target := "foo.bar.com"
 	b := NewBuilder()
 	cc := &testClientConn{target: target}
+
 	r, err := b.Build(resolver.Target{Endpoint: target}, cc, resolver.BuildOptions{})
 	if err != nil {
 		t.Fatalf("resolver.Build() returned error: %v\n", err)
@@ -1204,22 +1262,28 @@ func TestRateLimitedResolve(t *testing.T) {
 	if !ok {
 		t.Fatalf("resolver.Build() returned unexpected type: %T\n", dnsR)
 	}
+
 	tr, ok := dnsR.resolver.(*testResolver)
 	if !ok {
 		t.Fatalf("delegate resolver returned unexpected type: %T\n", tr)
 	}
 
-	// Wait for the first resolution request to be done. This happens as part of
-	// the first iteration of the for loop in watcher() because we start with a
-	// timer of zero duration.
+	// Observe the time before unblocking the lookupHost call.  The 100ms rate
+	// limiting timer will begin immediately after that.  This means the next
+	// resolution could happen less than 100ms if we read the time *after*
+	// receiving from tr.ch
+	start := time.Now()
+
+	// Wait for the first resolution request to be done. This happens as part
+	// of the first iteration of the for loop in watcher() because we call
+	// ResolveNow in Build.
 	<-tr.ch
 
 	// Here we start a couple of goroutines. One repeatedly calls ResolveNow()
 	// until asked to stop, and the other waits for two resolution requests to be
 	// made to our testResolver and stops the former. We measure the start and
 	// end times, and expect the duration elapsed to be in the interval
-	// {2*dnsResRate, 3*dnsResRate}
-	start := time.Now()
+	// {wantCalls*dnsResRate, wantCalls*dnsResRate}
 	done := make(chan struct{})
 	go func() {
 		for {
@@ -1234,7 +1298,7 @@ func TestRateLimitedResolve(t *testing.T) {
 	}()
 
 	gotCalls := 0
-	const wantCalls = 2
+	const wantCalls = 3
 	min, max := wantCalls*dnsResRate, (wantCalls+1)*dnsResRate
 	tMax := time.NewTimer(max)
 	for gotCalls != wantCalls {
@@ -1267,5 +1331,24 @@ func TestRateLimitedResolve(t *testing.T) {
 	}
 	if !reflect.DeepEqual(state.Addresses, wantAddrs) {
 		t.Errorf("Resolved addresses of target: %q = %+v, want %+v\n", target, state.Addresses, wantAddrs)
+	}
+}
+
+func TestReportError(t *testing.T) {
+	const target = "notfoundaddress"
+	cc := &testClientConn{target: target, errChan: make(chan error)}
+	b := NewBuilder()
+	r, err := b.Build(resolver.Target{Endpoint: target}, cc, resolver.BuildOptions{})
+	if err != nil {
+		t.Fatalf("%v\n", err)
+	}
+	defer r.Close()
+	select {
+	case err := <-cc.errChan:
+		if !strings.Contains(err.Error(), "hostLookup error") {
+			t.Fatalf(`ReportError(err=%v) called; want err contains "hostLookupError"`, err)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("did not receive error after 1s")
 	}
 }

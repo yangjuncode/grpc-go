@@ -15,16 +15,12 @@
  *
  */
 
-// Package resolver implements the xds resolver.
-//
-// At this point, the resolver is named xds-experimental, and doesn't do very
-// much at all, except for returning a hard-coded service config which selects
-// the xds_experimental balancer.
+// Package resolver implements the xds resolver, that does LDS and RDS to find
+// the cluster to use.
 package resolver
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
 	"google.golang.org/grpc"
@@ -39,9 +35,7 @@ import (
 
 // xDS balancer name is xds_experimental while resolver scheme is
 // xds-experimental since "_" is not a valid character in the URL.
-// TODO: Change this scheme name to "xds-experimental" once we delete the old
-// resolver implementation in xds_resolver_old.go
-const xdsScheme = "xds-experimental-new"
+const xdsScheme = "xds-experimental"
 
 // For overriding in unittests.
 var (
@@ -62,9 +56,9 @@ type xdsResolverBuilder struct{}
 // The xds bootstrap process is performed (and a new xds client is built) every
 // time an xds resolver is built.
 func (b *xdsResolverBuilder) Build(t resolver.Target, cc resolver.ClientConn, rbo resolver.BuildOptions) (resolver.Resolver, error) {
-	config := newXDSConfig()
-	if config.BalancerName == "" {
-		return nil, errors.New("xds: balancerName not found in bootstrap file")
+	config, err := newXDSConfig()
+	if err != nil {
+		return nil, fmt.Errorf("xds: failed to read bootstrap file: %v", err)
 	}
 	if config.Creds == nil {
 		// TODO: Once we start supporting a mechanism to register credential
@@ -161,7 +155,7 @@ type xdsResolver struct {
 const jsonFormatSC = `{
     "loadBalancingConfig":[
       {
-        "experimental_cds":{
+        "cds_experimental":{
           "Cluster": "%s"
         }
       }
@@ -177,7 +171,7 @@ func (r *xdsResolver) run() {
 		case update := <-r.updateCh:
 			if update.err != nil {
 				r.cc.ReportError(update.err)
-				return
+				continue
 			}
 			sc := fmt.Sprintf(jsonFormatSC, update.su.Cluster)
 			r.cc.UpdateState(resolver.State{

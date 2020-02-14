@@ -29,10 +29,10 @@ import (
 	anypb "github.com/golang/protobuf/ptypes/any"
 	"github.com/google/go-cmp/cmp"
 	"google.golang.org/grpc/xds/internal"
-	"google.golang.org/grpc/xds/internal/client/fakexds"
+	"google.golang.org/grpc/xds/internal/testutils"
 )
 
-func TestEDSParseRespProto(t *testing.T) {
+func (s) TestEDSParseRespProto(t *testing.T) {
 	tests := []struct {
 		name    string
 		m       *xdspb.ClusterLoadAssignment
@@ -161,14 +161,11 @@ var (
 	}
 )
 
-func TestEDSHandleResponse(t *testing.T) {
-	fakeServer, sCleanup := fakexds.StartServer(t)
-	client, cCleanup := fakeServer.GetClientConn(t)
-	defer func() {
-		cCleanup()
-		sCleanup()
-	}()
-	v2c := newV2Client(client, goodNodeProto, func(int) time.Duration { return 0 })
+func (s) TestEDSHandleResponse(t *testing.T) {
+	fakeServer, cc, cleanup := startServerAndGetCC(t)
+	defer cleanup()
+
+	v2c := newV2Client(cc, goodNodeProto, func(int) time.Duration { return 0 })
 	defer v2c.close()
 
 	tests := []struct {
@@ -228,61 +225,27 @@ func TestEDSHandleResponse(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			gotUpdateCh := make(chan *EDSUpdate, 1)
-			gotUpdateErrCh := make(chan error, 1)
+			testWatchHandle(t, &watchHandleTestcase{
+				responseToHandle: test.edsResponse,
+				wantHandleErr:    test.wantErr,
+				wantUpdate:       test.wantUpdate,
+				wantUpdateErr:    test.wantUpdateErr,
 
-			// Register a watcher, to trigger the v2Client to send an EDS request.
-			cancelWatch := v2c.watchEDS(goodEDSName, func(u *EDSUpdate, err error) {
-				t.Logf("in v2c.watchEDS callback, edsUpdate: %+v, err: %v", u, err)
-				gotUpdateCh <- u
-				gotUpdateErrCh <- err
+				edsWatch:      v2c.watchEDS,
+				watchReqChan:  fakeServer.XDSRequestChan,
+				handleXDSResp: v2c.handleEDSResponse,
 			})
-
-			// Wait till the request makes it to the fakeServer. This ensures that
-			// the watch request has been processed by the v2Client.
-			<-fakeServer.RequestChan
-
-			// Directly push the response through a call to handleEDSResponse,
-			// thereby bypassing the fakeServer.
-			if err := v2c.handleEDSResponse(test.edsResponse); (err != nil) != test.wantErr {
-				t.Fatalf("v2c.handleEDSResponse() returned err: %v, wantErr: %v", err, test.wantErr)
-			}
-
-			// If the test needs the callback to be invoked, verify the update and
-			// error pushed to the callback.
-			if test.wantUpdate != nil {
-				timer := time.NewTimer(defaultTestTimeout)
-				select {
-				case <-timer.C:
-					t.Fatal("Timeout when expecting EDS update")
-				case gotUpdate := <-gotUpdateCh:
-					timer.Stop()
-					if d := cmp.Diff(gotUpdate, test.wantUpdate); d != "" {
-						t.Fatalf("got EDS update : %+v, want %+v, diff: %v", gotUpdate, *test.wantUpdate, d)
-					}
-				}
-				// Since the callback that we registered pushes to both channels at
-				// the same time, this channel read should return immediately.
-				gotUpdateErr := <-gotUpdateErrCh
-				if (gotUpdateErr != nil) != test.wantUpdateErr {
-					t.Fatalf("got EDS update error {%v}, wantErr: %v", gotUpdateErr, test.wantUpdateErr)
-				}
-			}
-			cancelWatch()
 		})
 	}
 }
 
 // TestEDSHandleResponseWithoutWatch tests the case where the v2Client
 // receives an EDS response without a registered EDS watcher.
-func TestEDSHandleResponseWithoutWatch(t *testing.T) {
-	fakeServer, sCleanup := fakexds.StartServer(t)
-	client, cCleanup := fakeServer.GetClientConn(t)
-	defer func() {
-		cCleanup()
-		sCleanup()
-	}()
-	v2c := newV2Client(client, goodNodeProto, func(int) time.Duration { return 0 })
+func (s) TestEDSHandleResponseWithoutWatch(t *testing.T) {
+	_, cc, cleanup := startServerAndGetCC(t)
+	defer cleanup()
+
+	v2c := newV2Client(cc, goodNodeProto, func(int) time.Duration { return 0 })
 	defer v2c.close()
 
 	if v2c.handleEDSResponse(goodEDSResponse1) == nil {
@@ -290,44 +253,36 @@ func TestEDSHandleResponseWithoutWatch(t *testing.T) {
 	}
 }
 
-func TestEDSWatchExpiryTimer(t *testing.T) {
+func (s) TestEDSWatchExpiryTimer(t *testing.T) {
 	oldWatchExpiryTimeout := defaultWatchExpiryTimeout
-	defaultWatchExpiryTimeout = 1 * time.Second
+	defaultWatchExpiryTimeout = 500 * time.Millisecond
 	defer func() {
 		defaultWatchExpiryTimeout = oldWatchExpiryTimeout
 	}()
 
-	fakeServer, sCleanup := fakexds.StartServer(t)
-	client, cCleanup := fakeServer.GetClientConn(t)
-	defer func() {
-		cCleanup()
-		sCleanup()
-	}()
-	v2c := newV2Client(client, goodNodeProto, func(int) time.Duration { return 0 })
+	fakeServer, cc, cleanup := startServerAndGetCC(t)
+	defer cleanup()
+
+	v2c := newV2Client(cc, goodNodeProto, func(int) time.Duration { return 0 })
 	defer v2c.close()
 	t.Log("Started xds v2Client...")
 
-	edsCallbackCh := make(chan error, 1)
+	callbackCh := testutils.NewChannel()
 	v2c.watchEDS(goodRouteName1, func(u *EDSUpdate, err error) {
 		t.Logf("Received callback with edsUpdate {%+v} and error {%v}", u, err)
 		if u != nil {
-			edsCallbackCh <- fmt.Errorf("received EDSUpdate %v in edsCallback, wanted nil", u)
+			callbackCh.Send(fmt.Errorf("received EDSUpdate %v in edsCallback, wanted nil", u))
 		}
 		if err == nil {
-			edsCallbackCh <- errors.New("received nil error in edsCallback")
+			callbackCh.Send(errors.New("received nil error in edsCallback"))
 		}
-		edsCallbackCh <- nil
+		callbackCh.Send(nil)
 	})
-	<-fakeServer.RequestChan
 
-	timer := time.NewTimer(2 * time.Second)
-	select {
-	case <-timer.C:
-		t.Fatalf("Timeout expired when expecting EDS update")
-	case err := <-edsCallbackCh:
-		timer.Stop()
-		if err != nil {
-			t.Fatal(err)
-		}
+	// Wait till the request makes it to the fakeServer. This ensures that
+	// the watch request has been processed by the v2Client.
+	if _, err := fakeServer.XDSRequestChan.Receive(); err != nil {
+		t.Fatalf("Timeout expired when expecting an CDS request")
 	}
+	waitForNilErr(t, callbackCh)
 }

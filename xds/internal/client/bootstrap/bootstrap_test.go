@@ -25,6 +25,7 @@ import (
 	"github.com/golang/protobuf/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/google"
+	"google.golang.org/grpc/internal/grpctest"
 
 	corepb "github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
 	structpb "github.com/golang/protobuf/ptypes/struct"
@@ -54,19 +55,28 @@ var (
 	}
 )
 
+type s struct {
+	grpctest.Tester
+}
+
+func Test(t *testing.T) {
+	grpctest.RunSubTests(t, s{})
+}
+
 // TestNewConfig exercises the functionality in NewConfig with different
 // bootstrap file contents. It overrides the fileReadFunc by returning
 // bootstrap file contents defined in this test, instead of reading from a
 // file.
-func TestNewConfig(t *testing.T) {
+func (s) TestNewConfig(t *testing.T) {
 	bootstrapFileMap := map[string]string{
-		"empty":   "",
-		"badJSON": `["test": 123]`,
+		"empty":          "",
+		"badJSON":        `["test": 123]`,
+		"noBalancerName": `{"node": {"id": "ENVOY_NODE_ID"}}`,
 		"emptyNodeProto": `
 		{
-			"xds_server" : {
+			"xds_servers" : [{
 				"server_uri": "trafficdirector.googleapis.com:443"
-			}
+			}]
 		}`,
 		"emptyXdsServer": `
 		{
@@ -85,12 +95,12 @@ func TestNewConfig(t *testing.T) {
 				    "TRAFFICDIRECTOR_GRPC_HOSTNAME": "trafficdirector"
 			    }
 			},
-			"xds_server" : {
+			"xds_servers" : [{
 				"server_uri": "trafficdirector.googleapis.com:443",
 				"channel_creds": [
 					{ "type": "not-google-default" }
 				]
-			},
+			}],
 			"unknownField": "foobar"
 		}`,
 		"unknownFieldInNodeProto": `
@@ -101,7 +111,10 @@ func TestNewConfig(t *testing.T) {
 				"metadata": {
 				    "TRAFFICDIRECTOR_GRPC_HOSTNAME": "trafficdirector"
 			    }
-			}
+			},
+			"xds_servers" : [{
+				"server_uri": "trafficdirector.googleapis.com:443"
+			}]
 		}`,
 		"unknownFieldInXdsServer": `
 		{
@@ -111,13 +124,13 @@ func TestNewConfig(t *testing.T) {
 				    "TRAFFICDIRECTOR_GRPC_HOSTNAME": "trafficdirector"
 			    }
 			},
-			"xds_server" : {
+			"xds_servers" : [{
 				"server_uri": "trafficdirector.googleapis.com:443",
 				"channel_creds": [
 					{ "type": "not-google-default" }
 				],
 				"unknownField": "foobar"
-			}
+			}]
 		}`,
 		"emptyChannelCreds": `
 		{
@@ -127,9 +140,9 @@ func TestNewConfig(t *testing.T) {
 				    "TRAFFICDIRECTOR_GRPC_HOSTNAME": "trafficdirector"
 			    }
 			},
-			"xds_server" : {
+			"xds_servers" : [{
 				"server_uri": "trafficdirector.googleapis.com:443"
-			}
+			}]
 		}`,
 		"nonGoogleDefaultCreds": `
 		{
@@ -139,12 +152,12 @@ func TestNewConfig(t *testing.T) {
 				    "TRAFFICDIRECTOR_GRPC_HOSTNAME": "trafficdirector"
 			    }
 			},
-			"xds_server" : {
+			"xds_servers" : [{
 				"server_uri": "trafficdirector.googleapis.com:443",
 				"channel_creds": [
 					{ "type": "not-google-default" }
 				]
-			}
+			}]
 		}`,
 		"multipleChannelCreds": `
 		{
@@ -154,13 +167,13 @@ func TestNewConfig(t *testing.T) {
 				    "TRAFFICDIRECTOR_GRPC_HOSTNAME": "trafficdirector"
 			    }
 			},
-			"xds_server" : {
+			"xds_servers" : [{
 				"server_uri": "trafficdirector.googleapis.com:443",
 				"channel_creds": [
 					{ "type": "not-google-default" },
 					{ "type": "google_default" }
 				]
-			}
+			}]
 		}`,
 		"goodBootstrap": `
 		{
@@ -170,12 +183,31 @@ func TestNewConfig(t *testing.T) {
 				    "TRAFFICDIRECTOR_GRPC_HOSTNAME": "trafficdirector"
 			    }
 			},
-			"xds_server" : {
+			"xds_servers" : [{
 				"server_uri": "trafficdirector.googleapis.com:443",
 				"channel_creds": [
 					{ "type": "google_default" }
 				]
-			}
+			}]
+		}`,
+		"multipleXDSServers": `
+		{
+			"node": {
+				"id": "ENVOY_NODE_ID",
+				"metadata": {
+				    "TRAFFICDIRECTOR_GRPC_HOSTNAME": "trafficdirector"
+			    }
+			},
+			"xds_servers" : [
+				{
+					"server_uri": "trafficdirector.googleapis.com:443",
+					"channel_creds": [{ "type": "google_default" }]
+				},
+				{
+					"server_uri": "backup.never.use.com:1234",
+					"channel_creds": [{ "type": "not-google-default" }]
+				}
+			]
 		}`,
 	}
 
@@ -194,25 +226,25 @@ func TestNewConfig(t *testing.T) {
 	tests := []struct {
 		name       string
 		wantConfig *Config
+		wantError  bool
 	}{
-		{"nonExistentBootstrapFile", &Config{}},
-		{"empty", &Config{}},
-		{"badJSON", &Config{}},
-		{
-			"emptyNodeProto",
-			&Config{
-				BalancerName: "trafficdirector.googleapis.com:443",
-				NodeProto:    &corepb.Node{BuildVersion: gRPCVersion},
-			},
-		},
-		{"emptyXdsServer", &Config{NodeProto: nodeProto}},
-		{"unknownTopLevelFieldInFile", nilCredsConfig},
-		{"unknownFieldInNodeProto", &Config{NodeProto: nodeProto}},
-		{"unknownFieldInXdsServer", nilCredsConfig},
-		{"emptyChannelCreds", nilCredsConfig},
-		{"nonGoogleDefaultCreds", nilCredsConfig},
-		{"multipleChannelCreds", nonNilCredsConfig},
-		{"goodBootstrap", nonNilCredsConfig},
+		{"nonExistentBootstrapFile", nil, true},
+		{"empty", nil, true},
+		{"badJSON", nil, true},
+		{"emptyNodeProto", &Config{
+			BalancerName: "trafficdirector.googleapis.com:443",
+			NodeProto:    &corepb.Node{BuildVersion: gRPCVersion},
+		}, false},
+		{"noBalancerName", nil, true},
+		{"emptyXdsServer", nil, true},
+		{"unknownTopLevelFieldInFile", nilCredsConfig, false},
+		{"unknownFieldInNodeProto", nilCredsConfig, false},
+		{"unknownFieldInXdsServer", nilCredsConfig, false},
+		{"emptyChannelCreds", nilCredsConfig, false},
+		{"nonGoogleDefaultCreds", nilCredsConfig, false},
+		{"multipleChannelCreds", nonNilCredsConfig, false},
+		{"goodBootstrap", nonNilCredsConfig, false},
+		{"multipleXDSServers", nonNilCredsConfig, false},
 	}
 
 	for _, test := range tests {
@@ -220,7 +252,16 @@ func TestNewConfig(t *testing.T) {
 			if err := os.Setenv(fileEnv, test.name); err != nil {
 				t.Fatalf("os.Setenv(%s, %s) failed with error: %v", fileEnv, test.name, err)
 			}
-			config := NewConfig()
+			config, err := NewConfig()
+			if err != nil {
+				if !test.wantError {
+					t.Fatalf("unexpected error %v", err)
+				}
+				return
+			}
+			if test.wantError {
+				t.Fatalf("wantError: %v, got error %v", test.wantError, err)
+			}
 			if config.BalancerName != test.wantConfig.BalancerName {
 				t.Errorf("config.BalancerName is %s, want %s", config.BalancerName, test.wantConfig.BalancerName)
 			}
@@ -234,10 +275,10 @@ func TestNewConfig(t *testing.T) {
 	}
 }
 
-func TestNewConfigEnvNotSet(t *testing.T) {
+func (s) TestNewConfigEnvNotSet(t *testing.T) {
 	os.Unsetenv(fileEnv)
-	wantConfig := Config{}
-	if config := NewConfig(); *config != wantConfig {
-		t.Errorf("NewConfig() returned : %#v, wanted an empty Config object", config)
+	config, err := NewConfig()
+	if err == nil {
+		t.Errorf("NewConfig() returned: %#v, <nil>, wanted non-nil error", config)
 	}
 }

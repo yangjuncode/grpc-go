@@ -34,7 +34,7 @@ import (
 )
 
 // ccResolverWrapper is a wrapper on top of cc for resolvers.
-// It implements resolver.ClientConnection interface.
+// It implements resolver.ClientConn interface.
 type ccResolverWrapper struct {
 	cc         *ClientConn
 	resolverMu sync.Mutex
@@ -46,43 +46,9 @@ type ccResolverWrapper struct {
 	polling   chan struct{}
 }
 
-// split2 returns the values from strings.SplitN(s, sep, 2).
-// If sep is not found, it returns ("", "", false) instead.
-func split2(s, sep string) (string, string, bool) {
-	spl := strings.SplitN(s, sep, 2)
-	if len(spl) < 2 {
-		return "", "", false
-	}
-	return spl[0], spl[1], true
-}
-
-// parseTarget splits target into a struct containing scheme, authority and
-// endpoint.
-//
-// If target is not a valid scheme://authority/endpoint, it returns {Endpoint:
-// target}.
-func parseTarget(target string) (ret resolver.Target) {
-	var ok bool
-	ret.Scheme, ret.Endpoint, ok = split2(target, "://")
-	if !ok {
-		return resolver.Target{Endpoint: target}
-	}
-	ret.Authority, ret.Endpoint, ok = split2(ret.Endpoint, "/")
-	if !ok {
-		return resolver.Target{Endpoint: target}
-	}
-	return ret
-}
-
-// newCCResolverWrapper uses the resolver.Builder stored in the ClientConn to
-// build a Resolver and returns a ccResolverWrapper object which wraps the
-// newly built resolver.
-func newCCResolverWrapper(cc *ClientConn) (*ccResolverWrapper, error) {
-	rb := cc.dopts.resolverBuilder
-	if rb == nil {
-		return nil, fmt.Errorf("could not get resolver for scheme: %q", cc.parsedTarget.Scheme)
-	}
-
+// newCCResolverWrapper uses the resolver.Builder to build a Resolver and
+// returns a ccResolverWrapper object which wraps the newly built resolver.
+func newCCResolverWrapper(cc *ClientConn, rb resolver.Builder) (*ccResolverWrapper, error) {
 	ccr := &ccResolverWrapper{
 		cc:   cc,
 		done: grpcsync.NewEvent(),

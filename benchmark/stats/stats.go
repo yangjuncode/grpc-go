@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/internal/profiling"
 )
 
 // FeatureIndex is an enum for features that usually differ across individual
@@ -47,9 +48,12 @@ const (
 	MaxConcurrentCallsIndex
 	ReqSizeBytesIndex
 	RespSizeBytesIndex
+	ReqPayloadCurveIndex
+	RespPayloadCurveIndex
 	CompModesIndex
 	EnableChannelzIndex
 	EnablePreloaderIndex
+	EnableProfilingIndex
 
 	// MaxFeatureIndex is a place holder to indicate the total number of feature
 	// indices we have. Any new feature indices should be added above this.
@@ -90,25 +94,47 @@ type Features struct {
 	// benchmark run.
 	MaxConcurrentCalls int
 	// ReqSizeBytes is the request size in bytes used in this benchmark run.
+	// Unused if ReqPayloadCurve is non-nil.
 	ReqSizeBytes int
 	// RespSizeBytes is the response size in bytes used in this benchmark run.
+	// Unused if RespPayloadCurve is non-nil.
 	RespSizeBytes int
+	// ReqPayloadCurve is a histogram representing the shape a random
+	// distribution request payloads should take.
+	ReqPayloadCurve *PayloadCurve
+	// RespPayloadCurve is a histogram representing the shape a random
+	// distribution request payloads should take.
+	RespPayloadCurve *PayloadCurve
 	// ModeCompressor represents the compressor mode used.
 	ModeCompressor string
 	// EnableChannelz indicates if channelz was turned on.
 	EnableChannelz bool
+	// EnableProfiling indicates if profiling was turned on.
+	EnableProfiling bool
 	// EnablePreloader indicates if preloading was turned on.
 	EnablePreloader bool
 }
 
 // String returns all the feature values as a string.
 func (f Features) String() string {
+	var reqPayloadString, respPayloadString string
+	if f.ReqPayloadCurve != nil {
+		reqPayloadString = fmt.Sprintf("reqPayloadCurve_%s", f.ReqPayloadCurve.ShortHash())
+	} else {
+		reqPayloadString = fmt.Sprintf("reqSize_%vB", f.ReqSizeBytes)
+	}
+	if f.RespPayloadCurve != nil {
+		respPayloadString = fmt.Sprintf("respPayloadCurve_%s", f.RespPayloadCurve.ShortHash())
+	} else {
+		respPayloadString = fmt.Sprintf("respSize_%vB", f.RespSizeBytes)
+	}
 	return fmt.Sprintf("networkMode_%v-bufConn_%v-keepalive_%v-benchTime_%v-"+
-		"trace_%v-latency_%v-kbps_%v-MTU_%v-maxConcurrentCalls_%v-"+
-		"reqSize_%vB-respSize_%vB-compressor_%v-channelz_%v-preloader_%v",
-		f.NetworkMode, f.UseBufConn, f.EnableKeepalive, f.BenchTime,
-		f.EnableTrace, f.Latency, f.Kbps, f.MTU, f.MaxConcurrentCalls,
-		f.ReqSizeBytes, f.RespSizeBytes, f.ModeCompressor, f.EnableChannelz, f.EnablePreloader)
+		"trace_%v-latency_%v-kbps_%v-MTU_%v-maxConcurrentCalls_%v-%s-%s-"+
+		"compressor_%v-channelz_%v-profiling_%v-preloader_%v",
+		f.NetworkMode, f.UseBufConn, f.EnableKeepalive, f.BenchTime, f.EnableTrace,
+		f.Latency, f.Kbps, f.MTU, f.MaxConcurrentCalls, reqPayloadString,
+		respPayloadString, f.ModeCompressor, f.EnableChannelz, f.EnableProfiling,
+		f.EnablePreloader)
 }
 
 // SharedFeatures returns the shared features as a pretty printable string.
@@ -158,10 +184,16 @@ func (f Features) partialString(b *bytes.Buffer, wantFeatures []bool, sep, delim
 				b.WriteString(fmt.Sprintf("ReqSize%v%vB%v", sep, f.ReqSizeBytes, delim))
 			case RespSizeBytesIndex:
 				b.WriteString(fmt.Sprintf("RespSize%v%vB%v", sep, f.RespSizeBytes, delim))
+			case ReqPayloadCurveIndex:
+				b.WriteString(fmt.Sprintf("ReqPayloadCurve%vSHA-256:%v%v", sep, f.ReqPayloadCurve.Hash(), delim))
+			case RespPayloadCurveIndex:
+				b.WriteString(fmt.Sprintf("RespPayloadCurve%vSHA-256:%v%v", sep, f.RespPayloadCurve.Hash(), delim))
 			case CompModesIndex:
 				b.WriteString(fmt.Sprintf("Compressor%v%v%v", sep, f.ModeCompressor, delim))
 			case EnableChannelzIndex:
 				b.WriteString(fmt.Sprintf("Channelz%v%v%v", sep, f.EnableChannelz, delim))
+			case EnableProfilingIndex:
+				b.WriteString(fmt.Sprintf("Profiling%v%v%v", sep, f.EnableProfiling, delim))
 			case EnablePreloaderIndex:
 				b.WriteString(fmt.Sprintf("Preloader%v%v%v", sep, f.EnablePreloader, delim))
 			default:
@@ -226,6 +258,8 @@ type RunData struct {
 	NinetyNinth time.Duration
 	// Average is the average latency.
 	Average time.Duration
+	// Stream-level profiling data.
+	StreamStats []*profiling.Stat
 }
 
 type durationSlice []time.Duration
@@ -293,8 +327,17 @@ func (s *Stats) EndRun(count uint64) {
 		RespT:        float64(count) * float64(r.Features.RespSizeBytes) * 8 / r.Features.BenchTime.Seconds(),
 	}
 	s.computeLatencies(r)
+	s.drainProfiling(r)
 	s.dump(r)
 	s.hw = &histWrapper{}
+}
+
+// drainProfiling drains stats from internal/profiling.
+func (s *Stats) drainProfiling(r *BenchResults) {
+	results := profiling.StreamStats.Drain()
+	for _, stat := range results {
+		r.Data.StreamStats = append(r.Data.StreamStats, stat.(*profiling.Stat))
+	}
 }
 
 // EndUnconstrainedRun is similar to EndRun, but is to be used for

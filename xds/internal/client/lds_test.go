@@ -21,15 +21,14 @@ package client
 import (
 	"errors"
 	"fmt"
-	"reflect"
 	"testing"
 	"time"
 
 	xdspb "github.com/envoyproxy/go-control-plane/envoy/api/v2"
-	"google.golang.org/grpc/xds/internal/client/fakexds"
+	"google.golang.org/grpc/xds/internal/testutils"
 )
 
-func TestLDSGetRouteConfig(t *testing.T) {
+func (s) TestLDSGetRouteConfig(t *testing.T) {
 	tests := []struct {
 		name      string
 		lis       *xdspb.Listener
@@ -90,14 +89,11 @@ func TestLDSGetRouteConfig(t *testing.T) {
 // TestLDSHandleResponse starts a fake xDS server, makes a ClientConn to it,
 // and creates a v2Client using it. Then, it registers a watchLDS and tests
 // different LDS responses.
-func TestLDSHandleResponse(t *testing.T) {
-	fakeServer, sCleanup := fakexds.StartServer(t)
-	client, cCleanup := fakeServer.GetClientConn(t)
-	defer func() {
-		cCleanup()
-		sCleanup()
-	}()
-	v2c := newV2Client(client, goodNodeProto, func(int) time.Duration { return 0 })
+func (s) TestLDSHandleResponse(t *testing.T) {
+	fakeServer, cc, cleanup := startServerAndGetCC(t)
+	defer cleanup()
+
+	v2c := newV2Client(cc, goodNodeProto, func(int) time.Duration { return 0 })
 	defer v2c.close()
 
 	tests := []struct {
@@ -180,61 +176,27 @@ func TestLDSHandleResponse(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			gotUpdateCh := make(chan ldsUpdate, 1)
-			gotUpdateErrCh := make(chan error, 1)
+			testWatchHandle(t, &watchHandleTestcase{
+				responseToHandle: test.ldsResponse,
+				wantHandleErr:    test.wantErr,
+				wantUpdate:       test.wantUpdate,
+				wantUpdateErr:    test.wantUpdateErr,
 
-			// Register a watcher, to trigger the v2Client to send an LDS request.
-			cancelWatch := v2c.watchLDS(goodLDSTarget1, func(u ldsUpdate, err error) {
-				t.Logf("in v2c.watchLDS callback, ldsUpdate: %+v, err: %v", u, err)
-				gotUpdateCh <- u
-				gotUpdateErrCh <- err
+				ldsWatch:      v2c.watchLDS,
+				watchReqChan:  fakeServer.XDSRequestChan,
+				handleXDSResp: v2c.handleLDSResponse,
 			})
-
-			// Wait till the request makes it to the fakeServer. This ensures that
-			// the watch request has been processed by the v2Client.
-			<-fakeServer.RequestChan
-
-			// Directly push the response through a call to handleLDSResponse,
-			// thereby bypassing the fakeServer.
-			if err := v2c.handleLDSResponse(test.ldsResponse); (err != nil) != test.wantErr {
-				t.Fatalf("v2c.handleLDSResponse() returned err: %v, wantErr: %v", err, test.wantErr)
-			}
-
-			// If the test needs the callback to be invoked, verify the update and
-			// error pushed to the callback.
-			if test.wantUpdate != nil {
-				timer := time.NewTimer(defaultTestTimeout)
-				select {
-				case <-timer.C:
-					t.Fatal("Timeout when expecting LDS update")
-				case gotUpdate := <-gotUpdateCh:
-					timer.Stop()
-					if !reflect.DeepEqual(gotUpdate, *test.wantUpdate) {
-						t.Fatalf("got LDS update : %+v, want %+v", gotUpdate, *test.wantUpdate)
-					}
-				}
-				// Since the callback that we registered pushes to both channels at
-				// the same time, this channel read should return immediately.
-				gotUpdateErr := <-gotUpdateErrCh
-				if (gotUpdateErr != nil) != test.wantUpdateErr {
-					t.Fatalf("got LDS update error {%v}, wantErr: %v", gotUpdateErr, test.wantUpdateErr)
-				}
-			}
-			cancelWatch()
 		})
 	}
 }
 
 // TestLDSHandleResponseWithoutWatch tests the case where the v2Client receives
 // an LDS response without a registered watcher.
-func TestLDSHandleResponseWithoutWatch(t *testing.T) {
-	fakeServer, sCleanup := fakexds.StartServer(t)
-	client, cCleanup := fakeServer.GetClientConn(t)
-	defer func() {
-		cCleanup()
-		sCleanup()
-	}()
-	v2c := newV2Client(client, goodNodeProto, func(int) time.Duration { return 0 })
+func (s) TestLDSHandleResponseWithoutWatch(t *testing.T) {
+	_, cc, cleanup := startServerAndGetCC(t)
+	defer cleanup()
+
+	v2c := newV2Client(cc, goodNodeProto, func(int) time.Duration { return 0 })
 	defer v2c.close()
 
 	if v2c.handleLDSResponse(goodLDSResponse1) == nil {
@@ -245,45 +207,35 @@ func TestLDSHandleResponseWithoutWatch(t *testing.T) {
 // TestLDSWatchExpiryTimer tests the case where the client does not receive an
 // LDS response for the request that it sends out. We want the watch callback
 // to be invoked with an error once the watchExpiryTimer fires.
-func TestLDSWatchExpiryTimer(t *testing.T) {
+func (s) TestLDSWatchExpiryTimer(t *testing.T) {
 	oldWatchExpiryTimeout := defaultWatchExpiryTimeout
-	defaultWatchExpiryTimeout = 1 * time.Second
+	defaultWatchExpiryTimeout = 500 * time.Millisecond
 	defer func() {
 		defaultWatchExpiryTimeout = oldWatchExpiryTimeout
 	}()
 
-	fakeServer, sCleanup := fakexds.StartServer(t)
-	client, cCleanup := fakeServer.GetClientConn(t)
-	defer func() {
-		cCleanup()
-		sCleanup()
-	}()
-	v2c := newV2Client(client, goodNodeProto, func(int) time.Duration { return 0 })
+	fakeServer, cc, cleanup := startServerAndGetCC(t)
+	defer cleanup()
+
+	v2c := newV2Client(cc, goodNodeProto, func(int) time.Duration { return 0 })
 	defer v2c.close()
 
-	// Wait till the request makes it to the fakeServer. This ensures that
-	// the watch request has been processed by the v2Client.
-	callbackCh := make(chan error, 1)
+	callbackCh := testutils.NewChannel()
 	v2c.watchLDS(goodLDSTarget1, func(u ldsUpdate, err error) {
 		t.Logf("in v2c.watchLDS callback, ldsUpdate: %+v, err: %v", u, err)
 		if u.routeName != "" {
-			callbackCh <- fmt.Errorf("received routeName %v in ldsCallback, wanted empty string", u.routeName)
+			callbackCh.Send(fmt.Errorf("received routeName %v in ldsCallback, wanted empty string", u.routeName))
 		}
 		if err == nil {
-			callbackCh <- errors.New("received nil error in ldsCallback")
+			callbackCh.Send(errors.New("received nil error in ldsCallback"))
 		}
-		callbackCh <- nil
+		callbackCh.Send(nil)
 	})
-	<-fakeServer.RequestChan
 
-	timer := time.NewTimer(2 * time.Second)
-	select {
-	case <-timer.C:
-		t.Fatalf("Timeout expired when expecting LDS update")
-	case err := <-callbackCh:
-		timer.Stop()
-		if err != nil {
-			t.Fatal(err)
-		}
+	// Wait till the request makes it to the fakeServer. This ensures that
+	// the watch request has been processed by the v2Client.
+	if _, err := fakeServer.XDSRequestChan.Receive(); err != nil {
+		t.Fatalf("Timeout expired when expecting an LDS request")
 	}
+	waitForNilErr(t, callbackCh)
 }
