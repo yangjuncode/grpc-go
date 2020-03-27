@@ -39,7 +39,6 @@ import (
 	"golang.org/x/net/http2"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/internal/profiling"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/stats"
@@ -228,6 +227,8 @@ func (ht *serverHandlerTransport) WriteStatus(s *Stream, st *status.Status) erro
 
 	if err == nil { // transport has not been closed
 		if ht.stats != nil {
+			// Note: The trailer fields are compressed with hpack after this call returns.
+			// No WireLength field is set here.
 			ht.stats.HandleRPC(s.Context(), &stats.OutTrailer{
 				Trailer: s.trailer.Copy(),
 			})
@@ -263,7 +264,7 @@ func (ht *serverHandlerTransport) writeCommonHeaders(s *Stream) {
 	}
 }
 
-func (ht *serverHandlerTransport) Write(s *Stream, hdr []byte, data []byte, stat *profiling.Stat, opts *Options) error {
+func (ht *serverHandlerTransport) Write(s *Stream, hdr []byte, data []byte, opts *Options) error {
 	return ht.do(func() {
 		ht.writeCommonHeaders(s)
 		ht.rw.Write(hdr)
@@ -292,8 +293,11 @@ func (ht *serverHandlerTransport) WriteHeader(s *Stream, md metadata.MD) error {
 
 	if err == nil {
 		if ht.stats != nil {
+			// Note: The header fields are compressed with hpack after this call returns.
+			// No WireLength field is set here.
 			ht.stats.HandleRPC(s.Context(), &stats.OutHeader{
-				Header: md.Copy(),
+				Header:      md.Copy(),
+				Compression: s.sendCompress,
 			})
 		}
 	}
@@ -325,7 +329,6 @@ func (ht *serverHandlerTransport) HandleStreams(startStream func(*Stream), trace
 
 	req := ht.req
 
-	// TODO(adtac): set stat?
 	s := &Stream{
 		id:             0, // irrelevant
 		requestRead:    func(int) {},
@@ -340,7 +343,7 @@ func (ht *serverHandlerTransport) HandleStreams(startStream func(*Stream), trace
 		Addr: ht.RemoteAddr(),
 	}
 	if req.TLS != nil {
-		pr.AuthInfo = credentials.TLSInfo{State: *req.TLS, CommonAuthInfo: credentials.CommonAuthInfo{credentials.PrivacyAndIntegrity}}
+		pr.AuthInfo = credentials.TLSInfo{State: *req.TLS, CommonAuthInfo: credentials.CommonAuthInfo{SecurityLevel: credentials.PrivacyAndIntegrity}}
 	}
 	ctx = metadata.NewIncomingContext(ctx, ht.headerMD)
 	s.ctx = peer.NewContext(ctx, pr)
