@@ -17,7 +17,7 @@ import (
 )
 
 func recvForward(p *parser, c baseCodec, s *transport.Stream, dc Decompressor, maxReceiveMessageSize int, payInfo *payloadInfo, compressor encoding.Compressor) (msgBytes []byte, err error) {
-	d, err := recvAndDecompress(p, s, dc, maxReceiveMessageSize, payInfo, compressor, s.Stat())
+	d, err := recvAndDecompress(p, s, dc, maxReceiveMessageSize, payInfo, compressor)
 	if err != nil {
 		return nil, err
 	}
@@ -49,7 +49,7 @@ func (cs *clientStream) SendMsgForward(mBytes []byte) (err error) {
 		cs.sentLast = true
 	}
 	data := mBytes
-	compData, err := compress(data, cs.cp, cs.comp, nil)
+	compData, err := compress(data, cs.cp, cs.comp)
 	if err != nil {
 		return err
 	}
@@ -124,7 +124,7 @@ func (a *csAttempt) sendMsgForward(mBytes []byte, hdr, payld, data []byte) error
 		}
 		a.mu.Unlock()
 	}
-	if err := a.t.Write(a.s, hdr, payld, a.s.Stat(), &transport.Options{Last: !cs.desc.ClientStreams}); err != nil {
+	if err := a.t.Write(a.s, hdr, payld, &transport.Options{Last: !cs.desc.ClientStreams}); err != nil {
 		if !cs.desc.ClientStreams {
 			// For non-client-streaming RPCs, we return nil instead of EOF on error
 			// because the generated code requires it.  finish is not called; RecvMsg()
@@ -250,7 +250,7 @@ func (as *addrConnStream) SendMsgForward(mBytes []byte) (err error) {
 		as.sentLast = true
 	}
 	data := mBytes
-	compData, err := compress(data, as.cp, as.comp, nil)
+	compData, err := compress(data, as.cp, as.comp)
 	if err != nil {
 		return err
 	}
@@ -260,7 +260,7 @@ func (as *addrConnStream) SendMsgForward(mBytes []byte) (err error) {
 		return status.Errorf(codes.ResourceExhausted, "trying to send message larger than max (%d vs. %d)", len(payld), *as.callInfo.maxSendMessageSize)
 	}
 
-	if err := as.t.Write(as.s, hdr, payld, as.s.Stat(), &transport.Options{Last: !as.desc.ClientStreams}); err != nil {
+	if err := as.t.Write(as.s, hdr, payld, &transport.Options{Last: !as.desc.ClientStreams}); err != nil {
 		if !as.desc.ClientStreams {
 			// For non-client-streaming RPCs, we return nil instead of EOF on error
 			// because the generated code requires it.  finish is not called; RecvMsg()
