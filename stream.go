@@ -1332,6 +1332,10 @@ type ServerStream interface {
 	// calling RecvMsg on the same stream at the same time, but it is not
 	// safe to call RecvMsg on the same stream in different goroutines.
 	RecvMsg(m interface{}) error
+
+	SendMsgForward(req []byte) error
+
+	RecvMsgForward() ([]byte, error)
 }
 
 // serverStream implements a server side Stream.
