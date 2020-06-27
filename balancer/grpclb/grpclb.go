@@ -28,10 +28,9 @@ import (
 	"sync"
 	"time"
 
-	durationpb "github.com/golang/protobuf/ptypes/duration"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/balancer"
-	lbpb "google.golang.org/grpc/balancer/grpclb/grpc_lb_v1"
+	grpclbstate "google.golang.org/grpc/balancer/grpclb/state"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/grpclog"
@@ -39,6 +38,9 @@ import (
 	"google.golang.org/grpc/internal/backoff"
 	"google.golang.org/grpc/internal/resolver/dns"
 	"google.golang.org/grpc/resolver"
+
+	durationpb "github.com/golang/protobuf/ptypes/duration"
+	lbpb "google.golang.org/grpc/balancer/grpclb/grpc_lb_v1"
 )
 
 const (
@@ -48,6 +50,7 @@ const (
 )
 
 var errServerTerminatedConnection = errors.New("grpclb: failed to recv server list: server terminated connection")
+var logger = grpclog.Component("grpclb")
 
 func convertDuration(d *durationpb.Duration) time.Duration {
 	if d == nil {
@@ -148,11 +151,11 @@ func (b *lbBuilder) Build(cc balancer.ClientConn, opt balancer.BuildOptions) bal
 	if opt.CredsBundle != nil {
 		lb.grpclbClientConnCreds, err = opt.CredsBundle.NewWithMode(internal.CredsBundleModeBalancer)
 		if err != nil {
-			grpclog.Warningf("lbBalancer: client connection creds NewWithMode failed: %v", err)
+			logger.Warningf("lbBalancer: client connection creds NewWithMode failed: %v", err)
 		}
 		lb.grpclbBackendCreds, err = opt.CredsBundle.NewWithMode(internal.CredsBundleModeBackendFromBalancer)
 		if err != nil {
-			grpclog.Warningf("lbBalancer: backend creds NewWithMode failed: %v", err)
+			logger.Warningf("lbBalancer: backend creds NewWithMode failed: %v", err)
 		}
 	}
 
@@ -308,16 +311,16 @@ func (lb *lbBalancer) aggregateSubConnStates() connectivity.State {
 
 func (lb *lbBalancer) UpdateSubConnState(sc balancer.SubConn, scs balancer.SubConnState) {
 	s := scs.ConnectivityState
-	if grpclog.V(2) {
-		grpclog.Infof("lbBalancer: handle SubConn state change: %p, %v", sc, s)
+	if logger.V(2) {
+		logger.Infof("lbBalancer: handle SubConn state change: %p, %v", sc, s)
 	}
 	lb.mu.Lock()
 	defer lb.mu.Unlock()
 
 	oldS, ok := lb.scStates[sc]
 	if !ok {
-		if grpclog.V(2) {
-			grpclog.Infof("lbBalancer: got state changes for an unknown SubConn: %p, %v", sc, s)
+		if logger.V(2) {
+			logger.Infof("lbBalancer: got state changes for an unknown SubConn: %p, %v", sc, s)
 		}
 		return
 	}
@@ -391,8 +394,8 @@ func (lb *lbBalancer) handleServiceConfig(gc *grpclbServiceConfig) {
 	if lb.usePickFirst == newUsePickFirst {
 		return
 	}
-	if grpclog.V(2) {
-		grpclog.Infof("lbBalancer: switching mode, new usePickFirst: %+v", newUsePickFirst)
+	if logger.V(2) {
+		logger.Infof("lbBalancer: switching mode, new usePickFirst: %+v", newUsePickFirst)
 	}
 	lb.refreshSubConns(lb.backendAddrs, lb.inFallback, newUsePickFirst)
 }
@@ -403,18 +406,13 @@ func (lb *lbBalancer) ResolverError(error) {
 }
 
 func (lb *lbBalancer) UpdateClientConnState(ccs balancer.ClientConnState) error {
-	if grpclog.V(2) {
-		grpclog.Infof("lbBalancer: UpdateClientConnState: %+v", ccs)
+	if logger.V(2) {
+		logger.Infof("lbBalancer: UpdateClientConnState: %+v", ccs)
 	}
 	gc, _ := ccs.BalancerConfig.(*grpclbServiceConfig)
 	lb.handleServiceConfig(gc)
 
 	addrs := ccs.ResolverState.Addresses
-	if len(addrs) == 0 {
-		// There should be at least one address, either grpclb server or
-		// fallback. Empty address is not valid.
-		return balancer.ErrBadResolverState
-	}
 
 	var remoteBalancerAddrs, backendAddrs []resolver.Address
 	for _, a := range addrs {
@@ -424,6 +422,17 @@ func (lb *lbBalancer) UpdateClientConnState(ccs balancer.ClientConnState) error 
 		} else {
 			backendAddrs = append(backendAddrs, a)
 		}
+	}
+	if sd := grpclbstate.Get(ccs.ResolverState); sd != nil {
+		// Override any balancer addresses provided via
+		// ccs.ResolverState.Addresses.
+		remoteBalancerAddrs = sd.BalancerAddresses
+	}
+
+	if len(backendAddrs)+len(remoteBalancerAddrs) == 0 {
+		// There should be at least one address, either grpclb server or
+		// fallback. Empty address is not valid.
+		return balancer.ErrBadResolverState
 	}
 
 	if len(remoteBalancerAddrs) == 0 {

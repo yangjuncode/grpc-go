@@ -33,9 +33,7 @@ import (
 	"google.golang.org/grpc/xds/internal/client/bootstrap"
 )
 
-// xDS balancer name is xds_experimental while resolver scheme is
-// xds-experimental since "_" is not a valid character in the URL.
-const xdsScheme = "xds-experimental"
+const xdsScheme = "xds"
 
 // For overriding in unittests.
 var (
@@ -163,16 +161,6 @@ type xdsResolver struct {
 	cancelWatch func()
 }
 
-const jsonFormatSC = `{
-    "loadBalancingConfig":[
-      {
-        "cds_experimental":{
-          "Cluster": "%s"
-        }
-      }
-    ]
-  }`
-
 // run is a long running goroutine which blocks on receiving service updates
 // and passes it on the ClientConn.
 func (r *xdsResolver) run() {
@@ -182,10 +170,27 @@ func (r *xdsResolver) run() {
 		case update := <-r.updateCh:
 			if update.err != nil {
 				r.logger.Warningf("Watch error on resource %v from xds-client %p, %v", r.target.Endpoint, r.client, update.err)
+				if xdsclient.ErrType(update.err) == xdsclient.ErrorTypeResourceNotFound {
+					// If error is resource-not-found, it means the LDS resource
+					// was removed. Send an empty service config, which picks
+					// pick-first, with no address, and puts the ClientConn into
+					// transient failure..
+					r.cc.UpdateState(resolver.State{
+						ServiceConfig: r.cc.ParseServiceConfig("{}"),
+					})
+					continue
+				}
+				// Send error to ClientConn, and balancers, if error is not
+				// resource not found.
 				r.cc.ReportError(update.err)
 				continue
 			}
-			sc := fmt.Sprintf(jsonFormatSC, update.su.Cluster)
+			sc, err := serviceUpdateToJSON(update.su)
+			if err != nil {
+				r.logger.Warningf("failed to convert update to service config: %v", err)
+				r.cc.ReportError(err)
+				continue
+			}
 			r.logger.Infof("Received update on resource %v from xds-client %p, generated service config: %v", r.target.Endpoint, r.client, sc)
 			r.cc.UpdateState(resolver.State{
 				ServiceConfig: r.cc.ParseServiceConfig(sc),
@@ -215,4 +220,19 @@ func (r *xdsResolver) Close() {
 	r.client.Close()
 	r.cancelCtx()
 	r.logger.Infof("Shutdown")
+}
+
+// Keep scheme with "-experimental" temporarily. Remove after one release.
+const schemeExperimental = "xds-experimental"
+
+type xdsResolverExperimentalBuilder struct {
+	xdsResolverBuilder
+}
+
+func (*xdsResolverExperimentalBuilder) Scheme() string {
+	return schemeExperimental
+}
+
+func init() {
+	resolver.Register(&xdsResolverExperimentalBuilder{})
 }

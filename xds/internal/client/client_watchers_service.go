@@ -25,7 +25,9 @@ import (
 
 // ServiceUpdate contains update about the service.
 type ServiceUpdate struct {
-	Cluster string
+	// WeightedCluster is a map from cluster names (CDS resource to watch) to
+	// their weights.
+	WeightedCluster map[string]uint32
 }
 
 // WatchService uses LDS and RDS to discover information about the provided
@@ -62,6 +64,7 @@ type serviceUpdateWatcher struct {
 
 	mu        sync.Mutex
 	closed    bool
+	rdsName   string
 	rdsCancel func()
 }
 
@@ -72,16 +75,28 @@ func (w *serviceUpdateWatcher) handleLDSResp(update ldsUpdate, err error) {
 	if w.closed {
 		return
 	}
-	// TODO: this error case returns early, without canceling the existing RDS
-	// watch. If we decided to stop the RDS watch when LDS errors, move this
-	// after rdsCancel(). We may also need to check the error type and do
-	// different things based on that (e.g. cancel RDS watch only on
-	// resourceRemovedError, but not on connectionError).
 	if err != nil {
+		// We check the error type and do different things. For now, the only
+		// type we check is ResourceNotFound, which indicates the LDS resource
+		// was removed, and besides sending the error to callback, we also
+		// cancel the RDS watch.
+		if ErrType(err) == ErrorTypeResourceNotFound && w.rdsCancel != nil {
+			w.rdsCancel()
+			w.rdsName = ""
+			w.rdsCancel = nil
+		}
+		// The other error cases still return early without canceling the
+		// existing RDS watch.
 		w.serviceCb(ServiceUpdate{}, err)
 		return
 	}
 
+	if w.rdsName == update.routeName {
+		// If the new routeName is same as the previous, don't cancel and
+		// restart the RDS watch.
+		return
+	}
+	w.rdsName = update.routeName
 	if w.rdsCancel != nil {
 		w.rdsCancel()
 	}
@@ -95,11 +110,18 @@ func (w *serviceUpdateWatcher) handleRDSResp(update rdsUpdate, err error) {
 	if w.closed {
 		return
 	}
+	if w.rdsCancel == nil {
+		// This mean only the RDS watch is canceled, can happen if the LDS
+		// resource is removed.
+		return
+	}
 	if err != nil {
 		w.serviceCb(ServiceUpdate{}, err)
 		return
 	}
-	w.serviceCb(ServiceUpdate{Cluster: update.clusterName}, nil)
+	w.serviceCb(ServiceUpdate{
+		WeightedCluster: update.weightedCluster,
+	}, nil)
 }
 
 func (w *serviceUpdateWatcher) close() {

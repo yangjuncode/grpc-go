@@ -21,12 +21,12 @@ package grpc
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/grpclog"
 	"google.golang.org/grpc/internal"
 	internalserviceconfig "google.golang.org/grpc/internal/serviceconfig"
 	"google.golang.org/grpc/serviceconfig"
@@ -268,7 +268,7 @@ func parseServiceConfig(js string) *serviceconfig.ParseResult {
 	var rsc jsonSC
 	err := json.Unmarshal([]byte(js), &rsc)
 	if err != nil {
-		grpclog.Warningf("grpc: parseServiceConfig error unmarshaling %s due to %v", js, err)
+		logger.Warningf("grpc: parseServiceConfig error unmarshaling %s due to %v", js, err)
 		return &serviceconfig.ParseResult{Err: err}
 	}
 	sc := ServiceConfig{
@@ -294,7 +294,7 @@ func parseServiceConfig(js string) *serviceconfig.ParseResult {
 		}
 		d, err := parseDuration(m.Timeout)
 		if err != nil {
-			grpclog.Warningf("grpc: parseServiceConfig error unmarshaling %s due to %v", js, err)
+			logger.Warningf("grpc: parseServiceConfig error unmarshaling %s due to %v", js, err)
 			return &serviceconfig.ParseResult{Err: err}
 		}
 
@@ -303,7 +303,7 @@ func parseServiceConfig(js string) *serviceconfig.ParseResult {
 			Timeout:      d,
 		}
 		if mc.retryPolicy, err = convertRetryPolicy(m.RetryPolicy); err != nil {
-			grpclog.Warningf("grpc: parseServiceConfig error unmarshaling %s due to %v", js, err)
+			logger.Warningf("grpc: parseServiceConfig error unmarshaling %s due to %v", js, err)
 			return &serviceconfig.ParseResult{Err: err}
 		}
 		if m.MaxRequestMessageBytes != nil {
@@ -356,7 +356,7 @@ func convertRetryPolicy(jrp *jsonRetryPolicy) (p *retryPolicy, err error) {
 		*mb <= 0 ||
 		jrp.BackoffMultiplier <= 0 ||
 		len(jrp.RetryableStatusCodes) == 0 {
-		grpclog.Warningf("grpc: ignoring retry policy %v due to illegal configuration", jrp)
+		logger.Warningf("grpc: ignoring retry policy %v due to illegal configuration", jrp)
 		return nil, nil
 	}
 
@@ -399,4 +399,35 @@ func getMaxSize(mcMax, doptMax *int, defaultVal int) *int {
 
 func newInt(b int) *int {
 	return &b
+}
+
+func init() {
+	internal.EqualServiceConfigForTesting = equalServiceConfig
+}
+
+// equalServiceConfig compares two configs. The rawJSONString field is ignored,
+// because they may diff in white spaces.
+//
+// If any of them is NOT *ServiceConfig, return false.
+func equalServiceConfig(a, b serviceconfig.Config) bool {
+	aa, ok := a.(*ServiceConfig)
+	if !ok {
+		return false
+	}
+	bb, ok := b.(*ServiceConfig)
+	if !ok {
+		return false
+	}
+	aaRaw := aa.rawJSONString
+	aa.rawJSONString = ""
+	bbRaw := bb.rawJSONString
+	bb.rawJSONString = ""
+	defer func() {
+		aa.rawJSONString = aaRaw
+		bb.rawJSONString = bbRaw
+	}()
+	// Using reflect.DeepEqual instead of cmp.Equal because many balancer
+	// configs are unexported, and cmp.Equal cannot compare unexported fields
+	// from unexported structs.
+	return reflect.DeepEqual(aa, bb)
 }
