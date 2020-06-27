@@ -107,8 +107,8 @@ func (cs *clientStream) RecvMsgForward() (mBytes []byte, err error) {
 			if logEntry.Err == io.EOF {
 				logEntry.Err = nil
 			}
-			if peer, ok := peer.FromContext(cs.Context()); ok {
-				logEntry.PeerAddr = peer.Addr
+			if fromContext, ok := peer.FromContext(cs.Context()); ok {
+				logEntry.PeerAddr = fromContext.Addr
 			}
 			cs.binlog.Log(logEntry)
 		}
@@ -359,4 +359,135 @@ func (cs *clientStream) withRetryForward(op func(a *csAttempt) ([]byte, error), 
 			return data, err
 		}
 	}
+}
+
+func (ss *serverStream) SendMsgForward(req []byte) (err error) {
+	defer func() {
+		if ss.trInfo != nil {
+			ss.mu.Lock()
+			if ss.trInfo.tr != nil {
+				if err == nil {
+					ss.trInfo.tr.LazyLog(&payload{sent: true, msgBytes: req}, true)
+				} else {
+					ss.trInfo.tr.LazyLog(&fmtStringer{"%v", []interface{}{err}}, true)
+					ss.trInfo.tr.SetError()
+				}
+			}
+			ss.mu.Unlock()
+		}
+		if err != nil && err != io.EOF {
+			st, _ := status.FromError(toRPCErr(err))
+			ss.t.WriteStatus(ss.s, st)
+			// Non-user specified status was sent out. This should be an error
+			// case (as a server side Cancel maybe).
+			//
+			// This is not handled specifically now. User will return a final
+			// status from the service handler, we will log that error instead.
+			// This behavior is similar to an interceptor.
+		}
+		if channelz.IsOn() && err == nil {
+			ss.t.IncrMsgSent()
+		}
+	}()
+
+	// load hdr, payload, data
+	//hdr, payload, data, err := prepareMsg(m, ss.codec, ss.cp, ss.comp)
+	data := req
+	compData, err := compress(data, ss.cp, ss.comp)
+	if err != nil {
+		return err
+	}
+	hdr, payload := msgHeader(data, compData)
+
+	// TODO(dfawley): should we be checking len(data) instead?
+	if len(payload) > ss.maxSendMessageSize {
+		return status.Errorf(codes.ResourceExhausted, "trying to send message larger than max (%d vs. %d)", len(payload), ss.maxSendMessageSize)
+	}
+	if err := ss.t.Write(ss.s, hdr, payload, &transport.Options{Last: false}); err != nil {
+		return toRPCErr(err)
+	}
+	if ss.binlog != nil {
+		if !ss.serverHeaderBinlogged {
+			h, _ := ss.s.Header()
+			ss.binlog.Log(&binarylog.ServerHeader{
+				Header: h,
+			})
+			ss.serverHeaderBinlogged = true
+		}
+		ss.binlog.Log(&binarylog.ServerMessage{
+			Message: data,
+		})
+	}
+	if ss.statsHandler != nil {
+		ss.statsHandler.HandleRPC(ss.s.Context(), outPayload(false, nil, data, payload, time.Now()))
+	}
+	return nil
+}
+
+func (ss *serverStream) RecvMsgForward() (msgBytes []byte, err error) {
+	defer func() {
+		if ss.trInfo != nil {
+			ss.mu.Lock()
+			if ss.trInfo.tr != nil {
+				if err == nil {
+					ss.trInfo.tr.LazyLog(&payload{sent: false, msg: nil, msgBytes: msgBytes}, true)
+				} else if err != io.EOF {
+					ss.trInfo.tr.LazyLog(&fmtStringer{"%v", []interface{}{err}}, true)
+					ss.trInfo.tr.SetError()
+				}
+			}
+			ss.mu.Unlock()
+		}
+		if err != nil && err != io.EOF {
+			st, _ := status.FromError(toRPCErr(err))
+			ss.t.WriteStatus(ss.s, st)
+			// Non-user specified status was sent out. This should be an error
+			// case (as a server side Cancel maybe).
+			//
+			// This is not handled specifically now. User will return a final
+			// status from the service handler, we will log that error instead.
+			// This behavior is similar to an interceptor.
+		}
+		if channelz.IsOn() && err == nil {
+			ss.t.IncrMsgRecv()
+		}
+	}()
+	var payInfo *payloadInfo
+	if ss.statsHandler != nil || ss.binlog != nil {
+		payInfo = &payloadInfo{}
+	}
+	msgBytes, err = recvForward(ss.p, ss.codec, ss.s, ss.dc, ss.maxReceiveMessageSize, payInfo, ss.decomp)
+	if err != nil {
+		if err == io.EOF {
+			if ss.binlog != nil {
+				ss.binlog.Log(&binarylog.ClientHalfClose{})
+			}
+			return nil, err
+		}
+		if err == io.ErrUnexpectedEOF {
+			err = status.Errorf(codes.Internal, io.ErrUnexpectedEOF.Error())
+		}
+		return nil, toRPCErr(err)
+	}
+	if payInfo == nil {
+		payInfo = &payloadInfo{}
+	}
+	if ss.statsHandler != nil {
+
+		ss.statsHandler.HandleRPC(ss.s.Context(), &stats.InPayload{
+			RecvTime: time.Now(),
+			Payload:  msgBytes,
+			// TODO truncate large payload.
+			Data:       payInfo.uncompressedBytes,
+			WireLength: payInfo.wireLength,
+			Length:     len(payInfo.uncompressedBytes),
+		})
+	}
+	if ss.binlog != nil {
+		ss.binlog.Log(&binarylog.ClientMessage{
+			Message: payInfo.uncompressedBytes,
+		})
+	}
+	return msgBytes, nil
+
 }
