@@ -11,7 +11,7 @@ import (
 
 // This is a compile-time assertion to ensure that this generated file
 // is compatible with the grpc package it is being compiled against.
-const _ = grpc.SupportPackageIsVersion6
+const _ = grpc.SupportPackageIsVersion7
 
 // RouteGuideClient is the client API for RouteGuide service.
 //
@@ -158,7 +158,7 @@ func (x *routeGuideRouteChatClient) Recv() (*RouteNote, error) {
 }
 
 // RouteGuideServer is the server API for RouteGuide service.
-// All implementations should embed UnimplementedRouteGuideServer
+// All implementations must embed UnimplementedRouteGuideServer
 // for forward compatibility
 type RouteGuideServer interface {
 	// A simple RPC.
@@ -185,26 +185,35 @@ type RouteGuideServer interface {
 	// Accepts a stream of RouteNotes sent while a route is being traversed,
 	// while receiving other RouteNotes (e.g. from other users).
 	RouteChat(RouteGuide_RouteChatServer) error
+	mustEmbedUnimplementedRouteGuideServer()
 }
 
-// UnimplementedRouteGuideServer should be embedded to have forward compatible implementations.
+// UnimplementedRouteGuideServer must be embedded to have forward compatible implementations.
 type UnimplementedRouteGuideServer struct {
 }
 
-func (*UnimplementedRouteGuideServer) GetFeature(context.Context, *Point) (*Feature, error) {
+func (UnimplementedRouteGuideServer) GetFeature(context.Context, *Point) (*Feature, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetFeature not implemented")
 }
-func (*UnimplementedRouteGuideServer) ListFeatures(*Rectangle, RouteGuide_ListFeaturesServer) error {
+func (UnimplementedRouteGuideServer) ListFeatures(*Rectangle, RouteGuide_ListFeaturesServer) error {
 	return status.Errorf(codes.Unimplemented, "method ListFeatures not implemented")
 }
-func (*UnimplementedRouteGuideServer) RecordRoute(RouteGuide_RecordRouteServer) error {
+func (UnimplementedRouteGuideServer) RecordRoute(RouteGuide_RecordRouteServer) error {
 	return status.Errorf(codes.Unimplemented, "method RecordRoute not implemented")
 }
-func (*UnimplementedRouteGuideServer) RouteChat(RouteGuide_RouteChatServer) error {
+func (UnimplementedRouteGuideServer) RouteChat(RouteGuide_RouteChatServer) error {
 	return status.Errorf(codes.Unimplemented, "method RouteChat not implemented")
 }
+func (UnimplementedRouteGuideServer) mustEmbedUnimplementedRouteGuideServer() {}
 
-func RegisterRouteGuideServer(s *grpc.Server, srv RouteGuideServer) {
+// UnsafeRouteGuideServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to RouteGuideServer will
+// result in compilation errors.
+type UnsafeRouteGuideServer interface {
+	mustEmbedUnimplementedRouteGuideServer()
+}
+
+func RegisterRouteGuideServer(s grpc.ServiceRegistrar, srv RouteGuideServer) {
 	s.RegisterService(&_RouteGuide_serviceDesc, srv)
 }
 

@@ -11,7 +11,7 @@ import (
 
 // This is a compile-time assertion to ensure that this generated file
 // is compatible with the grpc package it is being compiled against.
-const _ = grpc.SupportPackageIsVersion6
+const _ = grpc.SupportPackageIsVersion7
 
 // MetricsServiceClient is the client API for MetricsService service.
 //
@@ -74,7 +74,7 @@ func (c *metricsServiceClient) GetGauge(ctx context.Context, in *GaugeRequest, o
 }
 
 // MetricsServiceServer is the server API for MetricsService service.
-// All implementations should embed UnimplementedMetricsServiceServer
+// All implementations must embed UnimplementedMetricsServiceServer
 // for forward compatibility
 type MetricsServiceServer interface {
 	// Returns the values of all the gauges that are currently being maintained by
@@ -82,20 +82,29 @@ type MetricsServiceServer interface {
 	GetAllGauges(*EmptyMessage, MetricsService_GetAllGaugesServer) error
 	// Returns the value of one gauge
 	GetGauge(context.Context, *GaugeRequest) (*GaugeResponse, error)
+	mustEmbedUnimplementedMetricsServiceServer()
 }
 
-// UnimplementedMetricsServiceServer should be embedded to have forward compatible implementations.
+// UnimplementedMetricsServiceServer must be embedded to have forward compatible implementations.
 type UnimplementedMetricsServiceServer struct {
 }
 
-func (*UnimplementedMetricsServiceServer) GetAllGauges(*EmptyMessage, MetricsService_GetAllGaugesServer) error {
+func (UnimplementedMetricsServiceServer) GetAllGauges(*EmptyMessage, MetricsService_GetAllGaugesServer) error {
 	return status.Errorf(codes.Unimplemented, "method GetAllGauges not implemented")
 }
-func (*UnimplementedMetricsServiceServer) GetGauge(context.Context, *GaugeRequest) (*GaugeResponse, error) {
+func (UnimplementedMetricsServiceServer) GetGauge(context.Context, *GaugeRequest) (*GaugeResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetGauge not implemented")
 }
+func (UnimplementedMetricsServiceServer) mustEmbedUnimplementedMetricsServiceServer() {}
 
-func RegisterMetricsServiceServer(s *grpc.Server, srv MetricsServiceServer) {
+// UnsafeMetricsServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to MetricsServiceServer will
+// result in compilation errors.
+type UnsafeMetricsServiceServer interface {
+	mustEmbedUnimplementedMetricsServiceServer()
+}
+
+func RegisterMetricsServiceServer(s grpc.ServiceRegistrar, srv MetricsServiceServer) {
 	s.RegisterService(&_MetricsService_serviceDesc, srv)
 }
 

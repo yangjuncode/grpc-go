@@ -11,7 +11,7 @@ import (
 
 // This is a compile-time assertion to ensure that this generated file
 // is compatible with the grpc package it is being compiled against.
-const _ = grpc.SupportPackageIsVersion6
+const _ = grpc.SupportPackageIsVersion7
 
 // ProfilingClient is the client API for Profiling service.
 //
@@ -65,14 +65,21 @@ type ProfilingServer interface {
 type UnimplementedProfilingServer struct {
 }
 
-func (*UnimplementedProfilingServer) Enable(context.Context, *EnableRequest) (*EnableResponse, error) {
+func (UnimplementedProfilingServer) Enable(context.Context, *EnableRequest) (*EnableResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Enable not implemented")
 }
-func (*UnimplementedProfilingServer) GetStreamStats(context.Context, *GetStreamStatsRequest) (*GetStreamStatsResponse, error) {
+func (UnimplementedProfilingServer) GetStreamStats(context.Context, *GetStreamStatsRequest) (*GetStreamStatsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetStreamStats not implemented")
 }
 
-func RegisterProfilingServer(s *grpc.Server, srv ProfilingServer) {
+// UnsafeProfilingServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to ProfilingServer will
+// result in compilation errors.
+type UnsafeProfilingServer interface {
+	mustEmbedUnimplementedProfilingServer()
+}
+
+func RegisterProfilingServer(s grpc.ServiceRegistrar, srv ProfilingServer) {
 	s.RegisterService(&_Profiling_serviceDesc, srv)
 }
 

@@ -21,7 +21,10 @@
 // queried by a client to remotely manage the gRPC profiling behaviour of an
 // application.
 //
-// This package and all its methods are EXPERIMENTAL.
+// Experimental
+//
+// Notice: This package is EXPERIMENTAL and may be changed or removed in a
+// later release.
 package service
 
 import (
@@ -34,6 +37,8 @@ import (
 	"google.golang.org/grpc/internal/profiling"
 	ppb "google.golang.org/grpc/profiling/proto"
 )
+
+var logger = grpclog.Component("profiling")
 
 // ProfilingConfig defines configuration options for the Init method.
 type ProfilingConfig struct {
@@ -96,9 +101,9 @@ func getProfilingServerInstance() *profilingServer {
 
 func (s *profilingServer) Enable(ctx context.Context, req *ppb.EnableRequest) (*ppb.EnableResponse, error) {
 	if req.Enabled {
-		grpclog.Infof("profilingServer: Enable: enabling profiling")
+		logger.Infof("profilingServer: Enable: enabling profiling")
 	} else {
-		grpclog.Infof("profilingServer: Enable: disabling profiling")
+		logger.Infof("profilingServer: Enable: disabling profiling")
 	}
 	profiling.Enable(req.Enabled)
 
@@ -131,12 +136,12 @@ func statToProtoStat(stat *profiling.Stat) *ppb.Stat {
 func (s *profilingServer) GetStreamStats(ctx context.Context, req *ppb.GetStreamStatsRequest) (*ppb.GetStreamStatsResponse, error) {
 	// Since the drain operation is destructive, only one client request should
 	// be served at a time.
-	grpclog.Infof("profilingServer: GetStreamStats: processing request")
+	logger.Infof("profilingServer: GetStreamStats: processing request")
 	s.drainMutex.Lock()
 	results := profiling.StreamStats.Drain()
 	s.drainMutex.Unlock()
 
-	grpclog.Infof("profilingServer: GetStreamStats: returning %v records", len(results))
+	logger.Infof("profilingServer: GetStreamStats: returning %v records", len(results))
 	streamStats := make([]*ppb.Stat, 0)
 	for _, stat := range results {
 		streamStats = append(streamStats, statToProtoStat(stat.(*profiling.Stat)))

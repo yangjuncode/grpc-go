@@ -11,7 +11,7 @@ import (
 
 // This is a compile-time assertion to ensure that this generated file
 // is compatible with the grpc package it is being compiled against.
-const _ = grpc.SupportPackageIsVersion6
+const _ = grpc.SupportPackageIsVersion7
 
 // RouteLookupServiceClient is the client API for RouteLookupService service.
 //
@@ -39,22 +39,31 @@ func (c *routeLookupServiceClient) RouteLookup(ctx context.Context, in *RouteLoo
 }
 
 // RouteLookupServiceServer is the server API for RouteLookupService service.
-// All implementations should embed UnimplementedRouteLookupServiceServer
+// All implementations must embed UnimplementedRouteLookupServiceServer
 // for forward compatibility
 type RouteLookupServiceServer interface {
 	// Lookup returns a target for a single key.
 	RouteLookup(context.Context, *RouteLookupRequest) (*RouteLookupResponse, error)
+	mustEmbedUnimplementedRouteLookupServiceServer()
 }
 
-// UnimplementedRouteLookupServiceServer should be embedded to have forward compatible implementations.
+// UnimplementedRouteLookupServiceServer must be embedded to have forward compatible implementations.
 type UnimplementedRouteLookupServiceServer struct {
 }
 
-func (*UnimplementedRouteLookupServiceServer) RouteLookup(context.Context, *RouteLookupRequest) (*RouteLookupResponse, error) {
+func (UnimplementedRouteLookupServiceServer) RouteLookup(context.Context, *RouteLookupRequest) (*RouteLookupResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method RouteLookup not implemented")
 }
+func (UnimplementedRouteLookupServiceServer) mustEmbedUnimplementedRouteLookupServiceServer() {}
 
-func RegisterRouteLookupServiceServer(s *grpc.Server, srv RouteLookupServiceServer) {
+// UnsafeRouteLookupServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to RouteLookupServiceServer will
+// result in compilation errors.
+type UnsafeRouteLookupServiceServer interface {
+	mustEmbedUnimplementedRouteLookupServiceServer()
+}
+
+func RegisterRouteLookupServiceServer(s grpc.ServiceRegistrar, srv RouteLookupServiceServer) {
 	s.RegisterService(&_RouteLookupService_serviceDesc, srv)
 }
 

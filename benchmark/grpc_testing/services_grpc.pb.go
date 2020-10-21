@@ -11,7 +11,7 @@ import (
 
 // This is a compile-time assertion to ensure that this generated file
 // is compatible with the grpc package it is being compiled against.
-const _ = grpc.SupportPackageIsVersion6
+const _ = grpc.SupportPackageIsVersion7
 
 // BenchmarkServiceClient is the client API for BenchmarkService service.
 //
@@ -108,7 +108,7 @@ func (x *benchmarkServiceUnconstrainedStreamingCallClient) Recv() (*SimpleRespon
 }
 
 // BenchmarkServiceServer is the server API for BenchmarkService service.
-// All implementations should embed UnimplementedBenchmarkServiceServer
+// All implementations must embed UnimplementedBenchmarkServiceServer
 // for forward compatibility
 type BenchmarkServiceServer interface {
 	// One request followed by one response.
@@ -120,23 +120,32 @@ type BenchmarkServiceServer interface {
 	// Unconstrainted streaming.
 	// Both server and client keep sending & receiving simultaneously.
 	UnconstrainedStreamingCall(BenchmarkService_UnconstrainedStreamingCallServer) error
+	mustEmbedUnimplementedBenchmarkServiceServer()
 }
 
-// UnimplementedBenchmarkServiceServer should be embedded to have forward compatible implementations.
+// UnimplementedBenchmarkServiceServer must be embedded to have forward compatible implementations.
 type UnimplementedBenchmarkServiceServer struct {
 }
 
-func (*UnimplementedBenchmarkServiceServer) UnaryCall(context.Context, *SimpleRequest) (*SimpleResponse, error) {
+func (UnimplementedBenchmarkServiceServer) UnaryCall(context.Context, *SimpleRequest) (*SimpleResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method UnaryCall not implemented")
 }
-func (*UnimplementedBenchmarkServiceServer) StreamingCall(BenchmarkService_StreamingCallServer) error {
+func (UnimplementedBenchmarkServiceServer) StreamingCall(BenchmarkService_StreamingCallServer) error {
 	return status.Errorf(codes.Unimplemented, "method StreamingCall not implemented")
 }
-func (*UnimplementedBenchmarkServiceServer) UnconstrainedStreamingCall(BenchmarkService_UnconstrainedStreamingCallServer) error {
+func (UnimplementedBenchmarkServiceServer) UnconstrainedStreamingCall(BenchmarkService_UnconstrainedStreamingCallServer) error {
 	return status.Errorf(codes.Unimplemented, "method UnconstrainedStreamingCall not implemented")
 }
+func (UnimplementedBenchmarkServiceServer) mustEmbedUnimplementedBenchmarkServiceServer() {}
 
-func RegisterBenchmarkServiceServer(s *grpc.Server, srv BenchmarkServiceServer) {
+// UnsafeBenchmarkServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to BenchmarkServiceServer will
+// result in compilation errors.
+type UnsafeBenchmarkServiceServer interface {
+	mustEmbedUnimplementedBenchmarkServiceServer()
+}
+
+func RegisterBenchmarkServiceServer(s grpc.ServiceRegistrar, srv BenchmarkServiceServer) {
 	s.RegisterService(&_BenchmarkService_serviceDesc, srv)
 }
 
@@ -349,7 +358,7 @@ func (c *workerServiceClient) QuitWorker(ctx context.Context, in *Void, opts ...
 }
 
 // WorkerServiceServer is the server API for WorkerService service.
-// All implementations should embed UnimplementedWorkerServiceServer
+// All implementations must embed UnimplementedWorkerServiceServer
 // for forward compatibility
 type WorkerServiceServer interface {
 	// Start server with specified workload.
@@ -370,26 +379,35 @@ type WorkerServiceServer interface {
 	CoreCount(context.Context, *CoreRequest) (*CoreResponse, error)
 	// Quit this worker
 	QuitWorker(context.Context, *Void) (*Void, error)
+	mustEmbedUnimplementedWorkerServiceServer()
 }
 
-// UnimplementedWorkerServiceServer should be embedded to have forward compatible implementations.
+// UnimplementedWorkerServiceServer must be embedded to have forward compatible implementations.
 type UnimplementedWorkerServiceServer struct {
 }
 
-func (*UnimplementedWorkerServiceServer) RunServer(WorkerService_RunServerServer) error {
+func (UnimplementedWorkerServiceServer) RunServer(WorkerService_RunServerServer) error {
 	return status.Errorf(codes.Unimplemented, "method RunServer not implemented")
 }
-func (*UnimplementedWorkerServiceServer) RunClient(WorkerService_RunClientServer) error {
+func (UnimplementedWorkerServiceServer) RunClient(WorkerService_RunClientServer) error {
 	return status.Errorf(codes.Unimplemented, "method RunClient not implemented")
 }
-func (*UnimplementedWorkerServiceServer) CoreCount(context.Context, *CoreRequest) (*CoreResponse, error) {
+func (UnimplementedWorkerServiceServer) CoreCount(context.Context, *CoreRequest) (*CoreResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method CoreCount not implemented")
 }
-func (*UnimplementedWorkerServiceServer) QuitWorker(context.Context, *Void) (*Void, error) {
+func (UnimplementedWorkerServiceServer) QuitWorker(context.Context, *Void) (*Void, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method QuitWorker not implemented")
 }
+func (UnimplementedWorkerServiceServer) mustEmbedUnimplementedWorkerServiceServer() {}
 
-func RegisterWorkerServiceServer(s *grpc.Server, srv WorkerServiceServer) {
+// UnsafeWorkerServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to WorkerServiceServer will
+// result in compilation errors.
+type UnsafeWorkerServiceServer interface {
+	mustEmbedUnimplementedWorkerServiceServer()
+}
+
+func RegisterWorkerServiceServer(s grpc.ServiceRegistrar, srv WorkerServiceServer) {
 	s.RegisterService(&_WorkerService_serviceDesc, srv)
 }
 

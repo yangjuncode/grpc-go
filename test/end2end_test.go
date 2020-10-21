@@ -224,7 +224,7 @@ func (s *testServer) UnaryCall(ctx context.Context, in *testpb.SimpleRequest) (*
 		if authType != s.security {
 			return nil, status.Errorf(codes.Unauthenticated, "Wrong auth type: got %q, want %q", authType, s.security)
 		}
-		if serverName != "x.test.youtube.com" {
+		if serverName != "x.test.example.com" {
 			return nil, status.Errorf(codes.Unauthenticated, "Unknown server name %q", serverName)
 		}
 	}
@@ -617,7 +617,7 @@ func (te *test) listenAndServe(ts testpb.TestServiceServer, listen func(network,
 		te.t.Fatalf("Failed to listen: %v", err)
 	}
 	if te.e.security == "tls" {
-		creds, err := credentials.NewServerTLSFromFile(testdata.Path("server1.pem"), testdata.Path("server1.key"))
+		creds, err := credentials.NewServerTLSFromFile(testdata.Path("x509/server1_cert.pem"), testdata.Path("x509/server1_key.pem"))
 		if err != nil {
 			te.t.Fatalf("Failed to generate credentials %v", err)
 		}
@@ -658,7 +658,7 @@ func (te *test) listenAndServe(ts testpb.TestServiceServer, listen func(network,
 		if te.e.security != "tls" {
 			te.t.Fatalf("unsupported environment settings")
 		}
-		cert, err := tls.LoadX509KeyPair(testdata.Path("server1.pem"), testdata.Path("server1.key"))
+		cert, err := tls.LoadX509KeyPair(testdata.Path("x509/server1_cert.pem"), testdata.Path("x509/server1_key.pem"))
 		if err != nil {
 			te.t.Fatal("tls.LoadX509KeyPair(server1.pem, server1.key) failed: ", err)
 		}
@@ -793,7 +793,7 @@ func (te *test) configDial(opts ...grpc.DialOption) ([]grpc.DialOption, string) 
 	}
 	switch te.e.security {
 	case "tls":
-		creds, err := credentials.NewClientTLSFromFile(testdata.Path("ca.pem"), "x.test.youtube.com")
+		creds, err := credentials.NewClientTLSFromFile(testdata.Path("x509/server_ca_cert.pem"), "x.test.example.com")
 		if err != nil {
 			te.t.Fatalf("Failed to load credentials: %v", err)
 		}
@@ -4535,7 +4535,7 @@ func testClientRequestBodyErrorUnexpectedEOF(t *testing.T, e env) {
 	te.startServer(ts)
 	defer te.tearDown()
 	te.withServerTester(func(st *serverTester) {
-		st.writeHeadersGRPC(1, "/grpc.testing.TestService/UnaryCall")
+		st.writeHeadersGRPC(1, "/grpc.testing.TestService/UnaryCall", false)
 		// Say we have 5 bytes coming, but set END_STREAM flag:
 		st.writeData(1, true, []byte{0, 0, 0, 0, 5})
 		st.wantAnyFrame() // wait for server to crash (it used to crash)
@@ -4559,7 +4559,7 @@ func testClientRequestBodyErrorCloseAfterLength(t *testing.T, e env) {
 	te.startServer(ts)
 	defer te.tearDown()
 	te.withServerTester(func(st *serverTester) {
-		st.writeHeadersGRPC(1, "/grpc.testing.TestService/UnaryCall")
+		st.writeHeadersGRPC(1, "/grpc.testing.TestService/UnaryCall", false)
 		// say we're sending 5 bytes, but then close the connection instead.
 		st.writeData(1, false, []byte{0, 0, 0, 0, 5})
 		st.cc.Close()
@@ -4582,7 +4582,7 @@ func testClientRequestBodyErrorCancel(t *testing.T, e env) {
 	te.startServer(ts)
 	defer te.tearDown()
 	te.withServerTester(func(st *serverTester) {
-		st.writeHeadersGRPC(1, "/grpc.testing.TestService/UnaryCall")
+		st.writeHeadersGRPC(1, "/grpc.testing.TestService/UnaryCall", false)
 		// Say we have 5 bytes coming, but cancel it instead.
 		st.writeRSTStream(1, http2.ErrCodeCancel)
 		st.writeData(1, false, []byte{0, 0, 0, 0, 5})
@@ -4595,7 +4595,7 @@ func testClientRequestBodyErrorCancel(t *testing.T, e env) {
 		}
 
 		// And now send an uncanceled (but still invalid), just to get a response.
-		st.writeHeadersGRPC(3, "/grpc.testing.TestService/UnaryCall")
+		st.writeHeadersGRPC(3, "/grpc.testing.TestService/UnaryCall", false)
 		st.writeData(3, true, []byte{0, 0, 0, 0, 0})
 		<-gotCall
 		st.wantAnyFrame()
@@ -4619,7 +4619,7 @@ func testClientRequestBodyErrorCancelStreamingInput(t *testing.T, e env) {
 	te.startServer(ts)
 	defer te.tearDown()
 	te.withServerTester(func(st *serverTester) {
-		st.writeHeadersGRPC(1, "/grpc.testing.TestService/StreamingInputCall")
+		st.writeHeadersGRPC(1, "/grpc.testing.TestService/StreamingInputCall", false)
 		// Say we have 5 bytes coming, but cancel it instead.
 		st.writeData(1, false, []byte{0, 0, 0, 0, 5})
 		st.writeRSTStream(1, http2.ErrCodeCancel)
@@ -4633,6 +4633,106 @@ func testClientRequestBodyErrorCancelStreamingInput(t *testing.T, e env) {
 		if grpc.Code(got) != codes.Canceled {
 			t.Errorf("error = %#v; want error code %s", got, codes.Canceled)
 		}
+	})
+}
+
+func (s) TestClientInitialHeaderEndStream(t *testing.T) {
+	for _, e := range listTestEnv() {
+		if e.httpHandler {
+			continue
+		}
+		testClientInitialHeaderEndStream(t, e)
+	}
+}
+
+func testClientInitialHeaderEndStream(t *testing.T, e env) {
+	// To ensure RST_STREAM is sent for illegal data write and not normal stream
+	// close.
+	frameCheckingDone := make(chan struct{})
+	// To ensure goroutine for test does not end before RPC handler performs error
+	// checking.
+	handlerDone := make(chan struct{})
+	te := newTest(t, e)
+	ts := &funcServer{streamingInputCall: func(stream testpb.TestService_StreamingInputCallServer) error {
+		defer close(handlerDone)
+		// Block on serverTester receiving RST_STREAM. This ensures server has closed
+		// stream before stream.Recv().
+		<-frameCheckingDone
+		data, err := stream.Recv()
+		if err == nil {
+			t.Errorf("unexpected data received in func server method: '%v'", data)
+		} else if status.Code(err) != codes.Canceled {
+			t.Errorf("expected canceled error, instead received '%v'", err)
+		}
+		return nil
+	}}
+	te.startServer(ts)
+	defer te.tearDown()
+	te.withServerTester(func(st *serverTester) {
+		// Send a headers with END_STREAM flag, but then write data.
+		st.writeHeadersGRPC(1, "/grpc.testing.TestService/StreamingInputCall", true)
+		st.writeData(1, false, []byte{0, 0, 0, 0, 0})
+		st.wantAnyFrame()
+		st.wantAnyFrame()
+		st.wantRSTStream(http2.ErrCodeStreamClosed)
+		close(frameCheckingDone)
+		<-handlerDone
+	})
+}
+
+func (s) TestClientSendDataAfterCloseSend(t *testing.T) {
+	for _, e := range listTestEnv() {
+		if e.httpHandler {
+			continue
+		}
+		testClientSendDataAfterCloseSend(t, e)
+	}
+}
+
+func testClientSendDataAfterCloseSend(t *testing.T, e env) {
+	// To ensure RST_STREAM is sent for illegal data write prior to execution of RPC
+	// handler.
+	frameCheckingDone := make(chan struct{})
+	// To ensure goroutine for test does not end before RPC handler performs error
+	// checking.
+	handlerDone := make(chan struct{})
+	te := newTest(t, e)
+	ts := &funcServer{streamingInputCall: func(stream testpb.TestService_StreamingInputCallServer) error {
+		defer close(handlerDone)
+		// Block on serverTester receiving RST_STREAM. This ensures server has closed
+		// stream before stream.Recv().
+		<-frameCheckingDone
+		for {
+			_, err := stream.Recv()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				if status.Code(err) != codes.Canceled {
+					t.Errorf("expected canceled error, instead received '%v'", err)
+				}
+				break
+			}
+		}
+		if err := stream.SendMsg(nil); err == nil {
+			t.Error("expected error sending message on stream after stream closed due to illegal data")
+		} else if status.Code(err) != codes.Internal {
+			t.Errorf("expected internal error, instead received '%v'", err)
+		}
+		return nil
+	}}
+	te.startServer(ts)
+	defer te.tearDown()
+	te.withServerTester(func(st *serverTester) {
+		st.writeHeadersGRPC(1, "/grpc.testing.TestService/StreamingInputCall", false)
+		// Send data with END_STREAM flag, but then write more data.
+		st.writeData(1, true, []byte{0, 0, 0, 0, 0})
+		st.writeData(1, false, []byte{0, 0, 0, 0, 0})
+		st.wantAnyFrame()
+		st.wantAnyFrame()
+		st.wantRSTStream(http2.ErrCodeStreamClosed)
+		close(frameCheckingDone)
+		<-handlerDone
 	})
 }
 
@@ -4919,15 +5019,14 @@ func logOutputHasContents(v []byte, wakeup chan<- bool) bool {
 	return false
 }
 
-var verboseLogs = flag.Bool("verbose_logs", false, "show all grpclog output, without filtering")
+var verboseLogs = flag.Bool("verbose_logs", false, "show all log output, without filtering")
 
 func noop() {}
 
-// declareLogNoise declares that t is expected to emit the following noisy phrases,
-// even on success. Those phrases will be filtered from grpclog output
-// and only be shown if *verbose_logs or t ends up failing.
-// The returned restore function should be called with defer to be run
-// before the test ends.
+// declareLogNoise declares that t is expected to emit the following noisy
+// phrases, even on success. Those phrases will be filtered from log output and
+// only be shown if *verbose_logs or t ends up failing. The returned restore
+// function should be called with defer to be run before the test ends.
 func declareLogNoise(t *testing.T, phrases ...string) (restore func()) {
 	if *verboseLogs {
 		return noop
@@ -4991,7 +5090,11 @@ type stubServer struct {
 	cc     *grpc.ClientConn
 	s      *grpc.Server
 
-	addr string // address of listener
+	// Parameters for Listen and Dial. Defaults will be used if these are empty
+	// before Start.
+	network string
+	address string
+	target  string
 
 	cleanups []func() // Lambdas executed in Stop(); populated by Start().
 
@@ -5012,14 +5115,21 @@ func (ss *stubServer) FullDuplexCall(stream testpb.TestService_FullDuplexCallSer
 
 // Start starts the server and creates a client connected to it.
 func (ss *stubServer) Start(sopts []grpc.ServerOption, dopts ...grpc.DialOption) error {
-	r := manual.NewBuilderWithScheme("whatever")
-	ss.r = r
-
-	lis, err := net.Listen("tcp", "localhost:0")
-	if err != nil {
-		return fmt.Errorf(`net.Listen("tcp", "localhost:0") = %v`, err)
+	if ss.network == "" {
+		ss.network = "tcp"
 	}
-	ss.addr = lis.Addr().String()
+	if ss.address == "" {
+		ss.address = "localhost:0"
+	}
+	if ss.target == "" {
+		ss.r = manual.NewBuilderWithScheme("whatever")
+	}
+
+	lis, err := net.Listen(ss.network, ss.address)
+	if err != nil {
+		return fmt.Errorf("net.Listen(%q, %q) = %v", ss.network, ss.address, err)
+	}
+	ss.address = lis.Addr().String()
 	ss.cleanups = append(ss.cleanups, func() { lis.Close() })
 
 	s := grpc.NewServer(sopts...)
@@ -5028,15 +5138,20 @@ func (ss *stubServer) Start(sopts []grpc.ServerOption, dopts ...grpc.DialOption)
 	ss.cleanups = append(ss.cleanups, s.Stop)
 	ss.s = s
 
-	target := ss.r.Scheme() + ":///" + ss.addr
+	opts := append([]grpc.DialOption{grpc.WithInsecure()}, dopts...)
+	if ss.r != nil {
+		ss.target = ss.r.Scheme() + ":///" + ss.address
+		opts = append(opts, grpc.WithResolvers(ss.r))
+	}
 
-	opts := append([]grpc.DialOption{grpc.WithInsecure(), grpc.WithResolvers(r)}, dopts...)
-	cc, err := grpc.Dial(target, opts...)
+	cc, err := grpc.Dial(ss.target, opts...)
 	if err != nil {
-		return fmt.Errorf("grpc.Dial(%q) = %v", target, err)
+		return fmt.Errorf("grpc.Dial(%q) = %v", ss.target, err)
 	}
 	ss.cc = cc
-	ss.r.UpdateState(resolver.State{Addresses: []resolver.Address{{Addr: ss.addr}}})
+	if ss.r != nil {
+		ss.r.UpdateState(resolver.State{Addresses: []resolver.Address{{Addr: ss.address}}})
+	}
 	if err := ss.waitForReady(cc); err != nil {
 		return err
 	}
@@ -5048,7 +5163,9 @@ func (ss *stubServer) Start(sopts []grpc.ServerOption, dopts ...grpc.DialOption)
 }
 
 func (ss *stubServer) newServiceConfig(sc string) {
-	ss.r.UpdateState(resolver.State{Addresses: []resolver.Address{{Addr: ss.addr}}, ServiceConfig: parseCfg(ss.r, sc)})
+	if ss.r != nil {
+		ss.r.UpdateState(resolver.State{Addresses: []resolver.Address{{Addr: ss.address}}, ServiceConfig: parseCfg(ss.r, sc)})
+	}
 }
 
 func (ss *stubServer) waitForReady(cc *grpc.ClientConn) error {

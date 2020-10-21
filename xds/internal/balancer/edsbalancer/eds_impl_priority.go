@@ -25,10 +25,8 @@ import (
 	"google.golang.org/grpc/balancer"
 	"google.golang.org/grpc/balancer/base"
 	"google.golang.org/grpc/connectivity"
-	"google.golang.org/grpc/grpclog"
 )
 
-var logger = grpclog.Component("xds")
 var errAllPrioritiesRemoved = errors.New("eds: no locality is provided, all priorities are removed")
 
 // handlePriorityChange handles priority after EDS adds/removes a
@@ -50,6 +48,12 @@ func (edsImpl *edsBalancerImpl) handlePriorityChange() {
 	// Everything was removed by EDS.
 	if !edsImpl.priorityLowest.isSet() {
 		edsImpl.priorityInUse = newPriorityTypeUnset()
+		// Stop the init timer. This can happen if the only priority is removed
+		// shortly after it's added.
+		if timer := edsImpl.priorityInitTimer; timer != nil {
+			timer.Stop()
+			edsImpl.priorityInitTimer = nil
+		}
 		edsImpl.cc.UpdateState(balancer.State{ConnectivityState: connectivity.TransientFailure, Picker: base.NewErrPicker(errAllPrioritiesRemoved)})
 		return
 	}
@@ -106,6 +110,7 @@ func (edsImpl *edsBalancerImpl) startPriority(priority priorityType) {
 	// currently avoided by handling balancer update in a goroutine (the run
 	// goroutine in the parent eds balancer). When priority balancer is split
 	// into its own, this asynchronous state handling needs to be copied.
+	p.stateAggregator.Start()
 	p.bg.Start()
 	// startPriority can be called when
 	// 1. first EDS resp, start p0
@@ -117,7 +122,7 @@ func (edsImpl *edsBalancerImpl) startPriority(priority priorityType) {
 	edsImpl.priorityInitTimer = time.AfterFunc(defaultPriorityInitTimeout, func() {
 		edsImpl.priorityMu.Lock()
 		defer edsImpl.priorityMu.Unlock()
-		if !edsImpl.priorityInUse.equal(priority) {
+		if !edsImpl.priorityInUse.isSet() || !edsImpl.priorityInUse.equal(priority) {
 			return
 		}
 		edsImpl.priorityInitTimer = nil
@@ -135,13 +140,13 @@ func (edsImpl *edsBalancerImpl) handlePriorityWithNewState(priority priorityType
 	defer edsImpl.priorityMu.Unlock()
 
 	if !edsImpl.priorityInUse.isSet() {
-		logger.Infof("eds: received picker update when no priority is in use (EDS returned an empty list)")
+		edsImpl.logger.Infof("eds: received picker update when no priority is in use (EDS returned an empty list)")
 		return false
 	}
 
 	if edsImpl.priorityInUse.higherThan(priority) {
 		// Lower priorities should all be closed, this is an unexpected update.
-		logger.Infof("eds: received picker update from priority lower then priorityInUse")
+		edsImpl.logger.Infof("eds: received picker update from priority lower then priorityInUse")
 		return false
 	}
 
@@ -193,7 +198,9 @@ func (edsImpl *edsBalancerImpl) handlePriorityWithNewStateReady(priority priorit
 		edsImpl.logger.Infof("Switching priority from %v to %v, because latter became Ready", edsImpl.priorityInUse, priority)
 		edsImpl.priorityInUse = priority
 		for i := priority.nextLower(); !i.lowerThan(edsImpl.priorityLowest); i = i.nextLower() {
-			edsImpl.priorityToLocalities[i].bg.Close()
+			bgwc := edsImpl.priorityToLocalities[i]
+			bgwc.stateAggregator.Stop()
+			bgwc.bg.Close()
 		}
 		return true
 	}
@@ -308,14 +315,18 @@ func (p priorityType) isSet() bool {
 }
 
 func (p priorityType) equal(p2 priorityType) bool {
+	if !p.isSet() && !p2.isSet() {
+		return true
+	}
 	if !p.isSet() || !p2.isSet() {
-		panic("priority unset")
+		return false
 	}
 	return p == p2
 }
 
 func (p priorityType) higherThan(p2 priorityType) bool {
 	if !p.isSet() || !p2.isSet() {
+		// TODO(menghanl): return an appropriate value instead of panic.
 		panic("priority unset")
 	}
 	return p.p < p2.p
@@ -323,6 +334,7 @@ func (p priorityType) higherThan(p2 priorityType) bool {
 
 func (p priorityType) lowerThan(p2 priorityType) bool {
 	if !p.isSet() || !p2.isSet() {
+		// TODO(menghanl): return an appropriate value instead of panic.
 		panic("priority unset")
 	}
 	return p.p > p2.p

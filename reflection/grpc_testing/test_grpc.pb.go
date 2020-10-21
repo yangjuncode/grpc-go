@@ -11,7 +11,7 @@ import (
 
 // This is a compile-time assertion to ensure that this generated file
 // is compatible with the grpc package it is being compiled against.
-const _ = grpc.SupportPackageIsVersion6
+const _ = grpc.SupportPackageIsVersion7
 
 // SearchServiceClient is the client API for SearchService service.
 //
@@ -70,25 +70,34 @@ func (x *searchServiceStreamingSearchClient) Recv() (*SearchResponse, error) {
 }
 
 // SearchServiceServer is the server API for SearchService service.
-// All implementations should embed UnimplementedSearchServiceServer
+// All implementations must embed UnimplementedSearchServiceServer
 // for forward compatibility
 type SearchServiceServer interface {
 	Search(context.Context, *SearchRequest) (*SearchResponse, error)
 	StreamingSearch(SearchService_StreamingSearchServer) error
+	mustEmbedUnimplementedSearchServiceServer()
 }
 
-// UnimplementedSearchServiceServer should be embedded to have forward compatible implementations.
+// UnimplementedSearchServiceServer must be embedded to have forward compatible implementations.
 type UnimplementedSearchServiceServer struct {
 }
 
-func (*UnimplementedSearchServiceServer) Search(context.Context, *SearchRequest) (*SearchResponse, error) {
+func (UnimplementedSearchServiceServer) Search(context.Context, *SearchRequest) (*SearchResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Search not implemented")
 }
-func (*UnimplementedSearchServiceServer) StreamingSearch(SearchService_StreamingSearchServer) error {
+func (UnimplementedSearchServiceServer) StreamingSearch(SearchService_StreamingSearchServer) error {
 	return status.Errorf(codes.Unimplemented, "method StreamingSearch not implemented")
 }
+func (UnimplementedSearchServiceServer) mustEmbedUnimplementedSearchServiceServer() {}
 
-func RegisterSearchServiceServer(s *grpc.Server, srv SearchServiceServer) {
+// UnsafeSearchServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to SearchServiceServer will
+// result in compilation errors.
+type UnsafeSearchServiceServer interface {
+	mustEmbedUnimplementedSearchServiceServer()
+}
+
+func RegisterSearchServiceServer(s grpc.ServiceRegistrar, srv SearchServiceServer) {
 	s.RegisterService(&_SearchService_serviceDesc, srv)
 }
 

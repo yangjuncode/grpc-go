@@ -11,7 +11,7 @@ import (
 
 // This is a compile-time assertion to ensure that this generated file
 // is compatible with the grpc package it is being compiled against.
-const _ = grpc.SupportPackageIsVersion6
+const _ = grpc.SupportPackageIsVersion7
 
 // TestServiceClient is the client API for TestService service.
 //
@@ -145,7 +145,7 @@ func (x *testServiceServerStreamCallClient) Recv() (*SimpleResponse, error) {
 }
 
 // TestServiceServer is the server API for TestService service.
-// All implementations should embed UnimplementedTestServiceServer
+// All implementations must embed UnimplementedTestServiceServer
 // for forward compatibility
 type TestServiceServer interface {
 	// One request followed by one response.
@@ -159,26 +159,35 @@ type TestServiceServer interface {
 	ClientStreamCall(TestService_ClientStreamCallServer) error
 	// Server stream
 	ServerStreamCall(*SimpleRequest, TestService_ServerStreamCallServer) error
+	mustEmbedUnimplementedTestServiceServer()
 }
 
-// UnimplementedTestServiceServer should be embedded to have forward compatible implementations.
+// UnimplementedTestServiceServer must be embedded to have forward compatible implementations.
 type UnimplementedTestServiceServer struct {
 }
 
-func (*UnimplementedTestServiceServer) UnaryCall(context.Context, *SimpleRequest) (*SimpleResponse, error) {
+func (UnimplementedTestServiceServer) UnaryCall(context.Context, *SimpleRequest) (*SimpleResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method UnaryCall not implemented")
 }
-func (*UnimplementedTestServiceServer) FullDuplexCall(TestService_FullDuplexCallServer) error {
+func (UnimplementedTestServiceServer) FullDuplexCall(TestService_FullDuplexCallServer) error {
 	return status.Errorf(codes.Unimplemented, "method FullDuplexCall not implemented")
 }
-func (*UnimplementedTestServiceServer) ClientStreamCall(TestService_ClientStreamCallServer) error {
+func (UnimplementedTestServiceServer) ClientStreamCall(TestService_ClientStreamCallServer) error {
 	return status.Errorf(codes.Unimplemented, "method ClientStreamCall not implemented")
 }
-func (*UnimplementedTestServiceServer) ServerStreamCall(*SimpleRequest, TestService_ServerStreamCallServer) error {
+func (UnimplementedTestServiceServer) ServerStreamCall(*SimpleRequest, TestService_ServerStreamCallServer) error {
 	return status.Errorf(codes.Unimplemented, "method ServerStreamCall not implemented")
 }
+func (UnimplementedTestServiceServer) mustEmbedUnimplementedTestServiceServer() {}
 
-func RegisterTestServiceServer(s *grpc.Server, srv TestServiceServer) {
+// UnsafeTestServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to TestServiceServer will
+// result in compilation errors.
+type UnsafeTestServiceServer interface {
+	mustEmbedUnimplementedTestServiceServer()
+}
+
+func RegisterTestServiceServer(s grpc.ServiceRegistrar, srv TestServiceServer) {
 	s.RegisterService(&_TestService_serviceDesc, srv)
 }
 

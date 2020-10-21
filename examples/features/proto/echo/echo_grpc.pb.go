@@ -11,7 +11,7 @@ import (
 
 // This is a compile-time assertion to ensure that this generated file
 // is compatible with the grpc package it is being compiled against.
-const _ = grpc.SupportPackageIsVersion6
+const _ = grpc.SupportPackageIsVersion7
 
 // EchoClient is the client API for Echo service.
 //
@@ -142,7 +142,7 @@ func (x *echoBidirectionalStreamingEchoClient) Recv() (*EchoResponse, error) {
 }
 
 // EchoServer is the server API for Echo service.
-// All implementations should embed UnimplementedEchoServer
+// All implementations must embed UnimplementedEchoServer
 // for forward compatibility
 type EchoServer interface {
 	// UnaryEcho is unary echo.
@@ -153,26 +153,35 @@ type EchoServer interface {
 	ClientStreamingEcho(Echo_ClientStreamingEchoServer) error
 	// BidirectionalStreamingEcho is bidi streaming.
 	BidirectionalStreamingEcho(Echo_BidirectionalStreamingEchoServer) error
+	mustEmbedUnimplementedEchoServer()
 }
 
-// UnimplementedEchoServer should be embedded to have forward compatible implementations.
+// UnimplementedEchoServer must be embedded to have forward compatible implementations.
 type UnimplementedEchoServer struct {
 }
 
-func (*UnimplementedEchoServer) UnaryEcho(context.Context, *EchoRequest) (*EchoResponse, error) {
+func (UnimplementedEchoServer) UnaryEcho(context.Context, *EchoRequest) (*EchoResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method UnaryEcho not implemented")
 }
-func (*UnimplementedEchoServer) ServerStreamingEcho(*EchoRequest, Echo_ServerStreamingEchoServer) error {
+func (UnimplementedEchoServer) ServerStreamingEcho(*EchoRequest, Echo_ServerStreamingEchoServer) error {
 	return status.Errorf(codes.Unimplemented, "method ServerStreamingEcho not implemented")
 }
-func (*UnimplementedEchoServer) ClientStreamingEcho(Echo_ClientStreamingEchoServer) error {
+func (UnimplementedEchoServer) ClientStreamingEcho(Echo_ClientStreamingEchoServer) error {
 	return status.Errorf(codes.Unimplemented, "method ClientStreamingEcho not implemented")
 }
-func (*UnimplementedEchoServer) BidirectionalStreamingEcho(Echo_BidirectionalStreamingEchoServer) error {
+func (UnimplementedEchoServer) BidirectionalStreamingEcho(Echo_BidirectionalStreamingEchoServer) error {
 	return status.Errorf(codes.Unimplemented, "method BidirectionalStreamingEcho not implemented")
 }
+func (UnimplementedEchoServer) mustEmbedUnimplementedEchoServer() {}
 
-func RegisterEchoServer(s *grpc.Server, srv EchoServer) {
+// UnsafeEchoServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to EchoServer will
+// result in compilation errors.
+type UnsafeEchoServer interface {
+	mustEmbedUnimplementedEchoServer()
+}
+
+func RegisterEchoServer(s grpc.ServiceRegistrar, srv EchoServer) {
 	s.RegisterService(&_Echo_serviceDesc, srv)
 }
 
