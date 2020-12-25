@@ -28,6 +28,7 @@ import (
 	"github.com/golang/protobuf/proto"
 	"github.com/google/go-cmp/cmp"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/internal/grpclog"
 	"google.golang.org/grpc/internal/grpctest"
 	"google.golang.org/grpc/internal/testutils"
@@ -60,7 +61,6 @@ const (
 	goodRouteName1           = "GoodRouteConfig1"
 	goodRouteName2           = "GoodRouteConfig2"
 	goodEDSName              = "GoodClusterAssignment1"
-	uninterestingRouteName   = "UninterestingRouteName"
 	uninterestingDomain      = "uninteresting.domain"
 	goodClusterName1         = "GoodClusterName1"
 	goodClusterName2         = "GoodClusterName2"
@@ -452,7 +452,9 @@ func testWatchHandle(t *testing.T, test *watchHandleTestcase) {
 	// Cannot directly compare test.wantUpdate with nil (typed vs non-typed nil:
 	// https://golang.org/doc/faq#nil_error).
 	if c := test.wantUpdate; c == nil || (reflect.ValueOf(c).Kind() == reflect.Ptr && reflect.ValueOf(c).IsNil()) {
-		update, err := gotUpdateCh.Receive(ctx)
+		sCtx, sCancel := context.WithTimeout(context.Background(), defaultTestShortTimeout)
+		defer sCancel()
+		update, err := gotUpdateCh.Receive(sCtx)
 		if err == context.DeadlineExceeded {
 			return
 		}
@@ -543,7 +545,7 @@ func (s) TestV2ClientBackoffAfterRecvError(t *testing.T) {
 	fakeServer.XDSResponseChan <- &fakeserver.Response{Err: errors.New("RPC error")}
 	t.Log("Bad LDS response pushed to fakeServer...")
 
-	timer := time.NewTimer(1 * time.Second)
+	timer := time.NewTimer(defaultTestShortTimeout)
 	select {
 	case <-timer.C:
 		t.Fatal("Timeout when expecting LDS update")
@@ -608,7 +610,7 @@ func (s) TestV2ClientRetriesAfterBrokenStream(t *testing.T) {
 	t.Log("Bad LDS response pushed to fakeServer...")
 
 	val, err := fakeServer.XDSRequestChan.Receive(ctx)
-	if err == context.DeadlineExceeded {
+	if err != nil {
 		t.Fatalf("Timeout expired when expecting LDS update")
 	}
 	gotRequest := val.(*fakeserver.Request)
@@ -633,7 +635,7 @@ func (s) TestV2ClientWatchWithoutStream(t *testing.T) {
 	rb := manual.NewBuilderWithScheme(scheme)
 	rb.InitialState(resolver.State{Addresses: []resolver.Address{{Addr: "no.such.server"}}})
 
-	cc, err := grpc.Dial(scheme+":///whatever", grpc.WithInsecure(), grpc.WithResolvers(rb))
+	cc, err := grpc.Dial(scheme+":///whatever", grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithResolvers(rb))
 	if err != nil {
 		t.Fatalf("Failed to dial ClientConn: %v", err)
 	}
@@ -661,9 +663,9 @@ func (s) TestV2ClientWatchWithoutStream(t *testing.T) {
 	v2c.AddWatch(xdsclient.ListenerResource, goodLDSTarget1)
 
 	// The watcher should receive an update, with a timeout error in it.
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	if v, err := callbackCh.Receive(ctx); err == nil {
+	sCtx, sCancel := context.WithTimeout(context.Background(), defaultTestShortTimeout)
+	defer sCancel()
+	if v, err := callbackCh.Receive(sCtx); err == nil {
 		t.Fatalf("Expect an timeout error from watcher, got %v", v)
 	}
 
@@ -673,7 +675,7 @@ func (s) TestV2ClientWatchWithoutStream(t *testing.T) {
 		Addresses: []resolver.Address{{Addr: fakeServer.Address}},
 	})
 
-	ctx, cancel = context.WithTimeout(context.Background(), defaultTestTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 	if _, err := fakeServer.XDSRequestChan.Receive(ctx); err != nil {
 		t.Fatalf("Timeout expired when expecting an LDS request")

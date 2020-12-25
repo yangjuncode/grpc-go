@@ -32,14 +32,11 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/tls/certprovider"
+	"google.golang.org/grpc/credentials/tls/certprovider/pemfile"
 	pb "google.golang.org/grpc/examples/helloworld/helloworld"
 	"google.golang.org/grpc/security/advancedtls/internal/testutils"
 	"google.golang.org/grpc/security/advancedtls/testdata"
-)
-
-var (
-	address = "localhost:50051"
-	port    = ":50051"
 )
 
 const (
@@ -104,7 +101,7 @@ func callAndVerify(msg string, client pb.GreeterClient, shouldFail bool) error {
 
 // TODO(ZhenLian): remove shouldFail and add ...DialOption to the function
 // signature to provider cleaner tests.
-func callAndVerifyWithClientConn(connCtx context.Context, msg string, creds credentials.TransportCredentials, shouldFail bool) (*grpc.ClientConn, pb.GreeterClient, error) {
+func callAndVerifyWithClientConn(connCtx context.Context, address string, msg string, creds credentials.TransportCredentials, shouldFail bool) (*grpc.ClientConn, pb.GreeterClient, error) {
 	var conn *grpc.ClientConn
 	var err error
 	// If we want the test to fail, we establish a non-blocking connection to
@@ -361,11 +358,12 @@ func (s) TestEnd2End(t *testing.T) {
 			}
 			s := grpc.NewServer(grpc.Creds(serverTLSCreds))
 			defer s.Stop()
-			lis, err := net.Listen("tcp", port)
+			lis, err := net.Listen("tcp", "localhost:0")
 			if err != nil {
 				t.Fatalf("failed to listen: %v", err)
 			}
 			defer lis.Close()
+			addr := fmt.Sprintf("localhost:%v", lis.Addr().(*net.TCPAddr).Port)
 			pb.RegisterGreeterServer(s, greeterServer{})
 			go s.Serve(lis)
 			clientOptions := &ClientOptions{
@@ -388,7 +386,7 @@ func (s) TestEnd2End(t *testing.T) {
 			// stage = 0, initial connection should succeed
 			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 			defer cancel()
-			conn, greetClient, err := callAndVerifyWithClientConn(ctx, "rpc call 1", clientTLSCreds, false)
+			conn, greetClient, err := callAndVerifyWithClientConn(ctx, addr, "rpc call 1", clientTLSCreds, false)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -405,7 +403,7 @@ func (s) TestEnd2End(t *testing.T) {
 			// stage = 1, new connection should fail
 			shortCtx, shortCancel := context.WithTimeout(context.Background(), defaultTestShortTimeout)
 			defer shortCancel()
-			conn2, greetClient, err := callAndVerifyWithClientConn(shortCtx, "rpc call 3", clientTLSCreds, true)
+			conn2, greetClient, err := callAndVerifyWithClientConn(shortCtx, addr, "rpc call 3", clientTLSCreds, true)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -414,7 +412,7 @@ func (s) TestEnd2End(t *testing.T) {
 			stage.increase()
 			// ------------------------Scenario 4------------------------------------
 			// stage = 2,  new connection should succeed
-			conn3, greetClient, err := callAndVerifyWithClientConn(ctx, "rpc call 4", clientTLSCreds, false)
+			conn3, greetClient, err := callAndVerifyWithClientConn(ctx, addr, "rpc call 4", clientTLSCreds, false)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -511,38 +509,38 @@ func copyFileContents(sourceFile, destinationFile string) error {
 
 // Create PEMFileProvider(s) watching the content changes of temporary
 // files.
-func createProviders(tmpFiles *tmpCredsFiles) (*PEMFileProvider, *PEMFileProvider, *PEMFileProvider, *PEMFileProvider, error) {
-	clientIdentityOptions := PEMFileProviderOptions{
-		CertFile:         tmpFiles.clientCertTmp.Name(),
-		KeyFile:          tmpFiles.clientKeyTmp.Name(),
-		IdentityInterval: credRefreshingInterval,
+func createProviders(tmpFiles *tmpCredsFiles) (certprovider.Provider, certprovider.Provider, certprovider.Provider, certprovider.Provider, error) {
+	clientIdentityOptions := pemfile.Options{
+		CertFile:        tmpFiles.clientCertTmp.Name(),
+		KeyFile:         tmpFiles.clientKeyTmp.Name(),
+		RefreshDuration: credRefreshingInterval,
 	}
-	clientIdentityProvider, err := NewPEMFileProvider(clientIdentityOptions)
+	clientIdentityProvider, err := pemfile.NewProvider(clientIdentityOptions)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	clientRootOptions := PEMFileProviderOptions{
-		TrustFile:    tmpFiles.clientTrustTmp.Name(),
-		RootInterval: credRefreshingInterval,
+	clientRootOptions := pemfile.Options{
+		RootFile:        tmpFiles.clientTrustTmp.Name(),
+		RefreshDuration: credRefreshingInterval,
 	}
-	clientRootProvider, err := NewPEMFileProvider(clientRootOptions)
+	clientRootProvider, err := pemfile.NewProvider(clientRootOptions)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	serverIdentityOptions := PEMFileProviderOptions{
-		CertFile:         tmpFiles.serverCertTmp.Name(),
-		KeyFile:          tmpFiles.serverKeyTmp.Name(),
-		IdentityInterval: credRefreshingInterval,
+	serverIdentityOptions := pemfile.Options{
+		CertFile:        tmpFiles.serverCertTmp.Name(),
+		KeyFile:         tmpFiles.serverKeyTmp.Name(),
+		RefreshDuration: credRefreshingInterval,
 	}
-	serverIdentityProvider, err := NewPEMFileProvider(serverIdentityOptions)
+	serverIdentityProvider, err := pemfile.NewProvider(serverIdentityOptions)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	serverRootOptions := PEMFileProviderOptions{
-		TrustFile:    tmpFiles.serverTrustTmp.Name(),
-		RootInterval: credRefreshingInterval,
+	serverRootOptions := pemfile.Options{
+		RootFile:        tmpFiles.serverTrustTmp.Name(),
+		RefreshDuration: credRefreshingInterval,
 	}
-	serverRootProvider, err := NewPEMFileProvider(serverRootOptions)
+	serverRootProvider, err := pemfile.NewProvider(serverRootOptions)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
@@ -650,11 +648,12 @@ func (s) TestPEMFileProviderEnd2End(t *testing.T) {
 			}
 			s := grpc.NewServer(grpc.Creds(serverTLSCreds))
 			defer s.Stop()
-			lis, err := net.Listen("tcp", port)
+			lis, err := net.Listen("tcp", "localhost:0")
 			if err != nil {
 				t.Fatalf("failed to listen: %v", err)
 			}
 			defer lis.Close()
+			addr := fmt.Sprintf("localhost:%v", lis.Addr().(*net.TCPAddr).Port)
 			pb.RegisterGreeterServer(s, greeterServer{})
 			go s.Serve(lis)
 			clientOptions := &ClientOptions{
@@ -677,7 +676,7 @@ func (s) TestPEMFileProviderEnd2End(t *testing.T) {
 			// At initialization, the connection should be good.
 			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 			defer cancel()
-			conn, greetClient, err := callAndVerifyWithClientConn(ctx, "rpc call 1", clientTLSCreds, false)
+			conn, greetClient, err := callAndVerifyWithClientConn(ctx, addr, "rpc call 1", clientTLSCreds, false)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -693,7 +692,7 @@ func (s) TestPEMFileProviderEnd2End(t *testing.T) {
 			}
 			// New connections should still be good, because the Provider didn't pick
 			// up the changes due to key-cert mismatch.
-			conn2, greetClient, err := callAndVerifyWithClientConn(ctx, "rpc call 3", clientTLSCreds, false)
+			conn2, greetClient, err := callAndVerifyWithClientConn(ctx, addr, "rpc call 3", clientTLSCreds, false)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -707,7 +706,7 @@ func (s) TestPEMFileProviderEnd2End(t *testing.T) {
 			// other side.
 			shortCtx, shortCancel := context.WithTimeout(context.Background(), defaultTestShortTimeout)
 			defer shortCancel()
-			conn3, greetClient, err := callAndVerifyWithClientConn(shortCtx, "rpc call 4", clientTLSCreds, true)
+			conn3, greetClient, err := callAndVerifyWithClientConn(shortCtx, addr, "rpc call 4", clientTLSCreds, true)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -718,11 +717,98 @@ func (s) TestPEMFileProviderEnd2End(t *testing.T) {
 			time.Sleep(sleepInterval)
 			// New connections should be good, because the other side is using
 			// *_trust_cert_2.pem now.
-			conn4, greetClient, err := callAndVerifyWithClientConn(ctx, "rpc call 5", clientTLSCreds, false)
+			conn4, greetClient, err := callAndVerifyWithClientConn(ctx, addr, "rpc call 5", clientTLSCreds, false)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer conn4.Close()
+		})
+	}
+}
+
+func (s) TestDefaultHostNameCheck(t *testing.T) {
+	cs := &testutils.CertStore{}
+	if err := cs.LoadCerts(); err != nil {
+		t.Fatalf("cs.LoadCerts() failed, err: %v", err)
+	}
+	for _, test := range []struct {
+		desc             string
+		clientRoot       *x509.CertPool
+		clientVerifyFunc CustomVerificationFunc
+		clientVType      VerificationType
+		serverCert       []tls.Certificate
+		serverVType      VerificationType
+		expectError      bool
+	}{
+		// Client side sets vType to CertAndHostVerification, and will do
+		// default hostname check. Server uses a cert without "localhost" or
+		// "127.0.0.1" as common name or SAN names, and will hence fail.
+		{
+			desc:        "Bad default hostname check",
+			clientRoot:  cs.ClientTrust1,
+			clientVType: CertAndHostVerification,
+			serverCert:  []tls.Certificate{cs.ServerCert1},
+			serverVType: CertAndHostVerification,
+			expectError: true,
+		},
+		// Client side sets vType to CertAndHostVerification, and will do
+		// default hostname check. Server uses a certificate with "localhost" as
+		// common name, and will hence pass the default hostname check.
+		{
+			desc:        "Good default hostname check",
+			clientRoot:  cs.ClientTrust1,
+			clientVType: CertAndHostVerification,
+			serverCert:  []tls.Certificate{cs.ServerPeerLocalhost1},
+			serverVType: CertAndHostVerification,
+			expectError: false,
+		},
+	} {
+		test := test
+		t.Run(test.desc, func(t *testing.T) {
+			// Start a server using ServerOptions in another goroutine.
+			serverOptions := &ServerOptions{
+				IdentityOptions: IdentityCertificateOptions{
+					Certificates: test.serverCert,
+				},
+				RequireClientCert: false,
+				VType:             test.serverVType,
+			}
+			serverTLSCreds, err := NewServerCreds(serverOptions)
+			if err != nil {
+				t.Fatalf("failed to create server creds: %v", err)
+			}
+			s := grpc.NewServer(grpc.Creds(serverTLSCreds))
+			defer s.Stop()
+			lis, err := net.Listen("tcp", "localhost:0")
+			if err != nil {
+				t.Fatalf("failed to listen: %v", err)
+			}
+			defer lis.Close()
+			addr := fmt.Sprintf("localhost:%v", lis.Addr().(*net.TCPAddr).Port)
+			pb.RegisterGreeterServer(s, greeterServer{})
+			go s.Serve(lis)
+			clientOptions := &ClientOptions{
+				VerifyPeer: test.clientVerifyFunc,
+				RootOptions: RootCertificateOptions{
+					RootCACerts: test.clientRoot,
+				},
+				VType: test.clientVType,
+			}
+			clientTLSCreds, err := NewClientCreds(clientOptions)
+			if err != nil {
+				t.Fatalf("clientTLSCreds failed to create")
+			}
+			shouldFail := false
+			if test.expectError {
+				shouldFail = true
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+			defer cancel()
+			conn, _, err := callAndVerifyWithClientConn(ctx, addr, "rpc call 1", clientTLSCreds, shouldFail)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
 		})
 	}
 }

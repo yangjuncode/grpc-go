@@ -20,6 +20,8 @@
 package testutils
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -54,8 +56,8 @@ type TestSubConn struct {
 	id string
 }
 
-// UpdateAddresses panics.
-func (tsc *TestSubConn) UpdateAddresses([]resolver.Address) { panic("not implemented") }
+// UpdateAddresses is a no-op.
+func (tsc *TestSubConn) UpdateAddresses([]resolver.Address) {}
 
 // Connect is a no-op.
 func (tsc *TestSubConn) Connect() {}
@@ -114,17 +116,11 @@ func (tcc *TestClientConn) NewSubConn(a []resolver.Address, o balancer.NewSubCon
 
 // RemoveSubConn removes the SubConn.
 func (tcc *TestClientConn) RemoveSubConn(sc balancer.SubConn) {
-	tcc.logger.Logf("testClientCOnn: RemoveSubConn(%p)", sc)
+	tcc.logger.Logf("testClientConn: RemoveSubConn(%p)", sc)
 	select {
 	case tcc.RemoveSubConnCh <- sc:
 	default:
 	}
-}
-
-// UpdateBalancerState implements balancer.Balancer API. It will be removed when
-// switching to the new balancer interface.
-func (tcc *TestClientConn) UpdateBalancerState(s connectivity.State, p balancer.Picker) {
-	panic("not implemented")
 }
 
 // UpdateState updates connectivity state and picker.
@@ -151,6 +147,21 @@ func (tcc *TestClientConn) ResolveNow(resolver.ResolveNowOptions) {
 // Target panics.
 func (tcc *TestClientConn) Target() string {
 	panic("not implemented")
+}
+
+// WaitForErrPicker waits until an error picker is pushed to this ClientConn.
+// Returns error if the provided context expires or a non-error picker is pushed
+// to the ClientConn.
+func (tcc *TestClientConn) WaitForErrPicker(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return errors.New("timeout when waiting for an error picker")
+	case picker := <-tcc.NewPickerCh:
+		if _, perr := picker.Pick(balancer.PickInfo{}); perr == nil {
+			return fmt.Errorf("balancer returned a picker which is not an error picker")
+		}
+	}
+	return nil
 }
 
 // IsRoundRobin checks whether f's return value is roundrobin of elements from

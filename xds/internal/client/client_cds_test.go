@@ -31,7 +31,9 @@ import (
 	anypb "github.com/golang/protobuf/ptypes/any"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	"google.golang.org/grpc/xds/internal/env"
 	"google.golang.org/grpc/xds/internal/version"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 const (
@@ -169,8 +171,45 @@ func (s) TestValidateCluster_Success(t *testing.T) {
 			},
 			wantUpdate: ClusterUpdate{ServiceName: serviceName, EnableLRS: true},
 		},
+		{
+			name: "happiest-case-with-circuitbreakers",
+			cluster: &v3clusterpb.Cluster{
+				Name:                 clusterName,
+				ClusterDiscoveryType: &v3clusterpb.Cluster_Type{Type: v3clusterpb.Cluster_EDS},
+				EdsClusterConfig: &v3clusterpb.Cluster_EdsClusterConfig{
+					EdsConfig: &v3corepb.ConfigSource{
+						ConfigSourceSpecifier: &v3corepb.ConfigSource_Ads{
+							Ads: &v3corepb.AggregatedConfigSource{},
+						},
+					},
+					ServiceName: serviceName,
+				},
+				LbPolicy: v3clusterpb.Cluster_ROUND_ROBIN,
+				CircuitBreakers: &v3clusterpb.CircuitBreakers{
+					Thresholds: []*v3clusterpb.CircuitBreakers_Thresholds{
+						{
+							Priority:    v3corepb.RoutingPriority_DEFAULT,
+							MaxRequests: wrapperspb.UInt32(512),
+						},
+						{
+							Priority:    v3corepb.RoutingPriority_HIGH,
+							MaxRequests: nil,
+						},
+					},
+				},
+				LrsServer: &v3corepb.ConfigSource{
+					ConfigSourceSpecifier: &v3corepb.ConfigSource_Self{
+						Self: &v3corepb.SelfConfigSource{},
+					},
+				},
+			},
+			wantUpdate: ClusterUpdate{ServiceName: serviceName, EnableLRS: true, MaxRequests: func() *uint32 { i := uint32(512); return &i }()},
+		},
 	}
 
+	origCircuitBreakingSupport := env.CircuitBreakingSupport
+	env.CircuitBreakingSupport = true
+	defer func() { env.CircuitBreakingSupport = origCircuitBreakingSupport }()
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			update, err := validateCluster(test.cluster)
@@ -201,6 +240,30 @@ func (s) TestValidateClusterWithSecurityConfig(t *testing.T) {
 		wantUpdate ClusterUpdate
 		wantErr    bool
 	}{
+		{
+			name: "transport-socket-unsupported-name",
+			cluster: &v3clusterpb.Cluster{
+				ClusterDiscoveryType: &v3clusterpb.Cluster_Type{Type: v3clusterpb.Cluster_EDS},
+				EdsClusterConfig: &v3clusterpb.Cluster_EdsClusterConfig{
+					EdsConfig: &v3corepb.ConfigSource{
+						ConfigSourceSpecifier: &v3corepb.ConfigSource_Ads{
+							Ads: &v3corepb.AggregatedConfigSource{},
+						},
+					},
+					ServiceName: serviceName,
+				},
+				LbPolicy: v3clusterpb.Cluster_ROUND_ROBIN,
+				TransportSocket: &v3corepb.TransportSocket{
+					Name: "unsupported-foo",
+					ConfigType: &v3corepb.TransportSocket_TypedConfig{
+						TypedConfig: &anypb.Any{
+							TypeUrl: version.V3UpstreamTLSContextURL,
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
 		{
 			name: "transport-socket-unsupported-typeURL",
 			cluster: &v3clusterpb.Cluster{
@@ -285,6 +348,36 @@ func (s) TestValidateClusterWithSecurityConfig(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name: "transport-socket-without-validation-context",
+			cluster: &v3clusterpb.Cluster{
+				ClusterDiscoveryType: &v3clusterpb.Cluster_Type{Type: v3clusterpb.Cluster_EDS},
+				EdsClusterConfig: &v3clusterpb.Cluster_EdsClusterConfig{
+					EdsConfig: &v3corepb.ConfigSource{
+						ConfigSourceSpecifier: &v3corepb.ConfigSource_Ads{
+							Ads: &v3corepb.AggregatedConfigSource{},
+						},
+					},
+					ServiceName: serviceName,
+				},
+				LbPolicy: v3clusterpb.Cluster_ROUND_ROBIN,
+				TransportSocket: &v3corepb.TransportSocket{
+					ConfigType: &v3corepb.TransportSocket_TypedConfig{
+						TypedConfig: &anypb.Any{
+							TypeUrl: version.V3UpstreamTLSContextURL,
+							Value: func() []byte {
+								tls := &v3tlspb.UpstreamTlsContext{
+									CommonTlsContext: &v3tlspb.CommonTlsContext{},
+								}
+								mtls, _ := proto.Marshal(tls)
+								return mtls
+							}(),
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
 			name: "happy-case-with-no-identity-certs",
 			cluster: &v3clusterpb.Cluster{
 				ClusterDiscoveryType: &v3clusterpb.Cluster_Type{Type: v3clusterpb.Cluster_EDS},
@@ -298,6 +391,7 @@ func (s) TestValidateClusterWithSecurityConfig(t *testing.T) {
 				},
 				LbPolicy: v3clusterpb.Cluster_ROUND_ROBIN,
 				TransportSocket: &v3corepb.TransportSocket{
+					Name: "envoy.transport_sockets.tls",
 					ConfigType: &v3corepb.TransportSocket_TypedConfig{
 						TypedConfig: &anypb.Any{
 							TypeUrl: version.V3UpstreamTLSContextURL,
@@ -342,6 +436,7 @@ func (s) TestValidateClusterWithSecurityConfig(t *testing.T) {
 				},
 				LbPolicy: v3clusterpb.Cluster_ROUND_ROBIN,
 				TransportSocket: &v3corepb.TransportSocket{
+					Name: "envoy.transport_sockets.tls",
 					ConfigType: &v3corepb.TransportSocket_TypedConfig{
 						TypedConfig: &anypb.Any{
 							TypeUrl: version.V3UpstreamTLSContextURL,
@@ -392,6 +487,7 @@ func (s) TestValidateClusterWithSecurityConfig(t *testing.T) {
 				},
 				LbPolicy: v3clusterpb.Cluster_ROUND_ROBIN,
 				TransportSocket: &v3corepb.TransportSocket{
+					Name: "envoy.transport_sockets.tls",
 					ConfigType: &v3corepb.TransportSocket_TypedConfig{
 						TypedConfig: &anypb.Any{
 							TypeUrl: version.V3UpstreamTLSContextURL,

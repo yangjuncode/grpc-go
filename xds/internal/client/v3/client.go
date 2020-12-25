@@ -24,10 +24,11 @@ import (
 	"fmt"
 
 	"github.com/golang/protobuf/proto"
+	statuspb "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/internal/grpclog"
 	xdsclient "google.golang.org/grpc/xds/internal/client"
-	"google.golang.org/grpc/xds/internal/client/load"
 	"google.golang.org/grpc/xds/internal/version"
 
 	v3corepb "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
@@ -67,7 +68,6 @@ func newClient(cc *grpc.ClientConn, opts xdsclient.BuildOptions) (xdsclient.APIC
 		cc:        cc,
 		parent:    opts.Parent,
 		nodeProto: nodeProto,
-		loadStore: opts.LoadStore,
 		logger:    opts.Logger,
 	}
 	v3c.ctx, v3c.cancelCtx = context.WithCancel(context.Background())
@@ -86,7 +86,6 @@ type client struct {
 	ctx       context.Context
 	cancelCtx context.CancelFunc
 	parent    xdsclient.UpdateHandler
-	loadStore *load.Store
 	logger    *grpclog.PrefixLogger
 
 	// ClientConn to the xDS gRPC server. Owned by the parent xdsClient.
@@ -106,7 +105,7 @@ func (v3c *client) NewStream(ctx context.Context) (grpc.ClientStream, error) {
 // - If this is an ack, version will be the version from the response.
 // - If this is a nack, version will be the previous acked version (from
 //   versionMap). If there was no ack before, it will be empty.
-func (v3c *client) SendRequest(s grpc.ClientStream, resourceNames []string, rType xdsclient.ResourceType, version, nonce string) error {
+func (v3c *client) SendRequest(s grpc.ClientStream, resourceNames []string, rType xdsclient.ResourceType, version, nonce, errMsg string) error {
 	stream, ok := s.(adsStream)
 	if !ok {
 		return fmt.Errorf("xds: Attempt to send request on unsupported stream type: %T", s)
@@ -117,7 +116,11 @@ func (v3c *client) SendRequest(s grpc.ClientStream, resourceNames []string, rTyp
 		ResourceNames: resourceNames,
 		VersionInfo:   version,
 		ResponseNonce: nonce,
-		// TODO: populate ErrorDetails for nack.
+	}
+	if errMsg != "" {
+		req.ErrorDetail = &statuspb.Status{
+			Code: int32(codes.InvalidArgument), Message: errMsg,
+		}
 	}
 	if err := stream.Send(req); err != nil {
 		return fmt.Errorf("xds: stream.Send(%+v) failed: %v", req, err)
@@ -178,8 +181,9 @@ func (v3c *client) HandleResponse(r proto.Message) (xdsclient.ResourceType, stri
 	return rType, resp.GetVersionInfo(), resp.GetNonce(), err
 }
 
-// handleLDSResponse processes an LDS response received from the xDS server. On
-// receipt of a good response, it also invokes the registered watcher callback.
+// handleLDSResponse processes an LDS response received from the management
+// server. On receipt of a good response, it also invokes the registered watcher
+// callback.
 func (v3c *client) handleLDSResponse(resp *v3discoverypb.DiscoveryResponse) error {
 	update, err := xdsclient.UnmarshalListener(resp.GetResources(), v3c.logger)
 	if err != nil {
@@ -189,9 +193,9 @@ func (v3c *client) handleLDSResponse(resp *v3discoverypb.DiscoveryResponse) erro
 	return nil
 }
 
-// handleRDSResponse processes an RDS response received from the xDS server. On
-// receipt of a good response, it caches validated resources and also invokes
-// the registered watcher callback.
+// handleRDSResponse processes an RDS response received from the management
+// server. On receipt of a good response, it caches validated resources and also
+// invokes the registered watcher callback.
 func (v3c *client) handleRDSResponse(resp *v3discoverypb.DiscoveryResponse) error {
 	update, err := xdsclient.UnmarshalRouteConfig(resp.GetResources(), v3c.logger)
 	if err != nil {
@@ -201,8 +205,9 @@ func (v3c *client) handleRDSResponse(resp *v3discoverypb.DiscoveryResponse) erro
 	return nil
 }
 
-// handleCDSResponse processes an CDS response received from the xDS server. On
-// receipt of a good response, it also invokes the registered watcher callback.
+// handleCDSResponse processes an CDS response received from the management
+// server. On receipt of a good response, it also invokes the registered watcher
+// callback.
 func (v3c *client) handleCDSResponse(resp *v3discoverypb.DiscoveryResponse) error {
 	update, err := xdsclient.UnmarshalCluster(resp.GetResources(), v3c.logger)
 	if err != nil {

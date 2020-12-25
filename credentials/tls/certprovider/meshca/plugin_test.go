@@ -26,6 +26,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -35,11 +36,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/protobuf/proto"
-
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/tls/certprovider"
-	configpb "google.golang.org/grpc/credentials/tls/certprovider/meshca/internal/meshca_experimental"
 	meshgrpc "google.golang.org/grpc/credentials/tls/certprovider/meshca/internal/v1"
 	meshpb "google.golang.org/grpc/credentials/tls/certprovider/meshca/internal/v1"
 	"google.golang.org/grpc/internal/testutils"
@@ -297,14 +295,13 @@ func (s) TestCreateCertificate(t *testing.T) {
 	e, addr, cancel := setup(t, opts{})
 	defer cancel()
 
-	// Set the MeshCA targetURI in the plugin configuration to point to our fake
-	// MeshCA.
-	cfg := proto.Clone(goodConfigFullySpecified).(*configpb.GoogleMeshCaConfig)
-	cfg.Server.GrpcServices[0].GetGoogleGrpc().TargetUri = addr
-	inputConfig := makeJSONConfig(t, cfg)
-	prov, err := certprovider.GetProvider(pluginName, inputConfig, certprovider.Options{})
+	// Set the MeshCA targetURI to point to our fake MeshCA.
+	inputConfig := json.RawMessage(fmt.Sprintf(goodConfigFormatStr, addr))
+
+	// Lookup MeshCA plugin builder, parse config and start the plugin.
+	prov, err := certprovider.GetProvider(pluginName, inputConfig, certprovider.BuildOptions{})
 	if err != nil {
-		t.Fatalf("certprovider.GetProvider(%s, %s) failed: %v", pluginName, cfg, err)
+		t.Fatalf("GetProvider(%s, %s) failed: %v", pluginName, string(inputConfig), err)
 	}
 	defer prov.Close()
 
@@ -339,14 +336,13 @@ func (s) TestCreateCertificateWithBackoff(t *testing.T) {
 	e, addr, cancel := setup(t, opts{withbackoff: true})
 	defer cancel()
 
-	// Set the MeshCA targetURI in the plugin configuration to point to our fake
-	// MeshCA.
-	cfg := proto.Clone(goodConfigFullySpecified).(*configpb.GoogleMeshCaConfig)
-	cfg.Server.GrpcServices[0].GetGoogleGrpc().TargetUri = addr
-	inputConfig := makeJSONConfig(t, cfg)
-	prov, err := certprovider.GetProvider(pluginName, inputConfig, certprovider.Options{})
+	// Set the MeshCA targetURI to point to our fake MeshCA.
+	inputConfig := json.RawMessage(fmt.Sprintf(goodConfigFormatStr, addr))
+
+	// Lookup MeshCA plugin builder, parse config and start the plugin.
+	prov, err := certprovider.GetProvider(pluginName, inputConfig, certprovider.BuildOptions{})
 	if err != nil {
-		t.Fatalf("certprovider.GetProvider(%s, %s) failed: %v", pluginName, cfg, err)
+		t.Fatalf("GetProvider(%s, %s) failed: %v", pluginName, string(inputConfig), err)
 	}
 	defer prov.Close()
 
@@ -394,14 +390,13 @@ func (s) TestCreateCertificateWithRefresh(t *testing.T) {
 	e, addr, cancel := setup(t, opts{withShortLife: true})
 	defer cancel()
 
-	// Set the MeshCA targetURI in the plugin configuration to point to our fake
-	// MeshCA.
-	cfg := proto.Clone(goodConfigFullySpecified).(*configpb.GoogleMeshCaConfig)
-	cfg.Server.GrpcServices[0].GetGoogleGrpc().TargetUri = addr
-	inputConfig := makeJSONConfig(t, cfg)
-	prov, err := certprovider.GetProvider(pluginName, inputConfig, certprovider.Options{})
+	// Set the MeshCA targetURI to point to our fake MeshCA.
+	inputConfig := json.RawMessage(fmt.Sprintf(goodConfigFormatStr, addr))
+
+	// Lookup MeshCA plugin builder, parse config and start the plugin.
+	prov, err := certprovider.GetProvider(pluginName, inputConfig, certprovider.BuildOptions{})
 	if err != nil {
-		t.Fatalf("certprovider.GetProvider(%s, %s) failed: %v", pluginName, cfg, err)
+		t.Fatalf("GetProvider(%s, %s) failed: %v", pluginName, string(inputConfig), err)
 	}
 	defer prov.Close()
 

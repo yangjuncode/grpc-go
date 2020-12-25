@@ -20,165 +20,22 @@ package client
 
 import (
 	"testing"
+	"time"
 
 	v2xdspb "github.com/envoyproxy/go-control-plane/envoy/api/v2"
 	v2routepb "github.com/envoyproxy/go-control-plane/envoy/api/v2/route"
 	v3corepb "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
-	v3listenerpb "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	v3routepb "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
-	v3httppb "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	v3typepb "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"github.com/golang/protobuf/proto"
 	anypb "github.com/golang/protobuf/ptypes/any"
 	wrapperspb "github.com/golang/protobuf/ptypes/wrappers"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+
 	"google.golang.org/grpc/xds/internal/version"
+	"google.golang.org/protobuf/types/known/durationpb"
 )
-
-func (s) TestGetRouteConfigFromListener(t *testing.T) {
-	const (
-		goodLDSTarget       = "lds.target.good:1111"
-		goodRouteConfigName = "GoodRouteConfig"
-	)
-
-	tests := []struct {
-		name      string
-		lis       *v3listenerpb.Listener
-		wantRoute string
-		wantErr   bool
-	}{
-		{
-			name:      "no-apiListener-field",
-			lis:       &v3listenerpb.Listener{},
-			wantRoute: "",
-			wantErr:   true,
-		},
-		{
-			name: "badly-marshaled-apiListener",
-			lis: &v3listenerpb.Listener{
-				Name: goodLDSTarget,
-				ApiListener: &v3listenerpb.ApiListener{
-					ApiListener: &anypb.Any{
-						TypeUrl: version.V3HTTPConnManagerURL,
-						Value:   []byte{1, 2, 3, 4},
-					},
-				},
-			},
-			wantRoute: "",
-			wantErr:   true,
-		},
-		{
-			name: "wrong-type-in-apiListener",
-			lis: &v3listenerpb.Listener{
-				Name: goodLDSTarget,
-				ApiListener: &v3listenerpb.ApiListener{
-					ApiListener: &anypb.Any{
-						TypeUrl: version.V2ListenerURL,
-						Value: func() []byte {
-							cm := &v3httppb.HttpConnectionManager{
-								RouteSpecifier: &v3httppb.HttpConnectionManager_Rds{
-									Rds: &v3httppb.Rds{
-										ConfigSource: &v3corepb.ConfigSource{
-											ConfigSourceSpecifier: &v3corepb.ConfigSource_Ads{Ads: &v3corepb.AggregatedConfigSource{}},
-										},
-										RouteConfigName: goodRouteConfigName}}}
-							mcm, _ := proto.Marshal(cm)
-							return mcm
-						}()}}},
-			wantRoute: "",
-			wantErr:   true,
-		},
-		{
-			name: "empty-httpConnMgr-in-apiListener",
-			lis: &v3listenerpb.Listener{
-				Name: goodLDSTarget,
-				ApiListener: &v3listenerpb.ApiListener{
-					ApiListener: &anypb.Any{
-						TypeUrl: version.V3HTTPConnManagerURL,
-						Value: func() []byte {
-							cm := &v3httppb.HttpConnectionManager{
-								RouteSpecifier: &v3httppb.HttpConnectionManager_Rds{
-									Rds: &v3httppb.Rds{},
-								},
-							}
-							mcm, _ := proto.Marshal(cm)
-							return mcm
-						}()}}},
-			wantRoute: "",
-			wantErr:   true,
-		},
-		{
-			name: "scopedRoutes-routeConfig-in-apiListener",
-			lis: &v3listenerpb.Listener{
-				Name: goodLDSTarget,
-				ApiListener: &v3listenerpb.ApiListener{
-					ApiListener: &anypb.Any{
-						TypeUrl: version.V3HTTPConnManagerURL,
-						Value: func() []byte {
-							cm := &v3httppb.HttpConnectionManager{
-								RouteSpecifier: &v3httppb.HttpConnectionManager_ScopedRoutes{},
-							}
-							mcm, _ := proto.Marshal(cm)
-							return mcm
-						}()}}},
-			wantRoute: "",
-			wantErr:   true,
-		},
-		{
-			name: "rds.ConfigSource-in-apiListener-is-not-ADS",
-			lis: &v3listenerpb.Listener{
-				Name: goodLDSTarget,
-				ApiListener: &v3listenerpb.ApiListener{
-					ApiListener: &anypb.Any{
-						TypeUrl: version.V3HTTPConnManagerURL,
-						Value: func() []byte {
-							cm := &v3httppb.HttpConnectionManager{
-								RouteSpecifier: &v3httppb.HttpConnectionManager_Rds{
-									Rds: &v3httppb.Rds{
-										ConfigSource: &v3corepb.ConfigSource{
-											ConfigSourceSpecifier: &v3corepb.ConfigSource_Path{
-												Path: "/some/path",
-											},
-										},
-										RouteConfigName: goodRouteConfigName}}}
-							mcm, _ := proto.Marshal(cm)
-							return mcm
-						}()}}},
-			wantRoute: "",
-			wantErr:   true,
-		},
-		{
-			name: "goodListener",
-			lis: &v3listenerpb.Listener{
-				Name: goodLDSTarget,
-				ApiListener: &v3listenerpb.ApiListener{
-					ApiListener: &anypb.Any{
-						TypeUrl: version.V3HTTPConnManagerURL,
-						Value: func() []byte {
-							cm := &v3httppb.HttpConnectionManager{
-								RouteSpecifier: &v3httppb.HttpConnectionManager_Rds{
-									Rds: &v3httppb.Rds{
-										ConfigSource: &v3corepb.ConfigSource{
-											ConfigSourceSpecifier: &v3corepb.ConfigSource_Ads{Ads: &v3corepb.AggregatedConfigSource{}},
-										},
-										RouteConfigName: goodRouteConfigName}}}
-							mcm, _ := proto.Marshal(cm)
-							return mcm
-						}()}}},
-			wantRoute: goodRouteConfigName,
-			wantErr:   false,
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			gotRoute, err := getRouteConfigNameFromListener(test.lis, nil)
-			if (err != nil) != test.wantErr || gotRoute != test.wantRoute {
-				t.Errorf("getRouteConfigNameFromListener(%+v) = (%s, %v), want (%s, %v)", test.lis, gotRoute, err, test.wantRoute, test.wantErr)
-			}
-		})
-	}
-}
 
 func (s) TestRDSGenerateRDSUpdateFromRouteConfiguration(t *testing.T) {
 	const (
@@ -280,7 +137,14 @@ func (s) TestRDSGenerateRDSUpdateFromRouteConfiguration(t *testing.T) {
 							Route: &v3routepb.RouteAction{
 								ClusterSpecifier: &v3routepb.RouteAction_Cluster{Cluster: clusterName},
 							}}}}}}},
-			wantError: true,
+			wantUpdate: RouteConfigUpdate{
+				VirtualHosts: []*VirtualHost{
+					{
+						Domains: []string{ldsTarget},
+						Routes:  []*Route{{Prefix: newStringP("/"), CaseInsensitive: true, Action: map[string]uint32{clusterName: 1}}},
+					},
+				},
+			},
 		},
 		{
 			name: "good-route-config-with-empty-string-route",
@@ -428,13 +292,103 @@ func (s) TestRDSGenerateRDSUpdateFromRouteConfiguration(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "good-route-config-with-max-stream-duration",
+			rc: &v3routepb.RouteConfiguration{
+				Name: routeName,
+				VirtualHosts: []*v3routepb.VirtualHost{
+					{
+						Domains: []string{ldsTarget},
+						Routes: []*v3routepb.Route{
+							{
+								Match: &v3routepb.RouteMatch{PathSpecifier: &v3routepb.RouteMatch_Prefix{Prefix: "/"}},
+								Action: &v3routepb.Route_Route{
+									Route: &v3routepb.RouteAction{
+										ClusterSpecifier:  &v3routepb.RouteAction_Cluster{Cluster: clusterName},
+										MaxStreamDuration: &v3routepb.RouteAction_MaxStreamDuration{MaxStreamDuration: durationpb.New(time.Second)},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			wantUpdate: RouteConfigUpdate{
+				VirtualHosts: []*VirtualHost{
+					{
+						Domains: []string{ldsTarget},
+						Routes:  []*Route{{Prefix: newStringP("/"), Action: map[string]uint32{clusterName: 1}, MaxStreamDuration: time.Second}},
+					},
+				},
+			},
+		},
+		{
+			name: "good-route-config-with-grpc-timeout-header-max",
+			rc: &v3routepb.RouteConfiguration{
+				Name: routeName,
+				VirtualHosts: []*v3routepb.VirtualHost{
+					{
+						Domains: []string{ldsTarget},
+						Routes: []*v3routepb.Route{
+							{
+								Match: &v3routepb.RouteMatch{PathSpecifier: &v3routepb.RouteMatch_Prefix{Prefix: "/"}},
+								Action: &v3routepb.Route_Route{
+									Route: &v3routepb.RouteAction{
+										ClusterSpecifier:  &v3routepb.RouteAction_Cluster{Cluster: clusterName},
+										MaxStreamDuration: &v3routepb.RouteAction_MaxStreamDuration{GrpcTimeoutHeaderMax: durationpb.New(time.Second)},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			wantUpdate: RouteConfigUpdate{
+				VirtualHosts: []*VirtualHost{
+					{
+						Domains: []string{ldsTarget},
+						Routes:  []*Route{{Prefix: newStringP("/"), Action: map[string]uint32{clusterName: 1}, MaxStreamDuration: time.Second}},
+					},
+				},
+			},
+		},
+		{
+			name: "good-route-config-with-both-timeouts",
+			rc: &v3routepb.RouteConfiguration{
+				Name: routeName,
+				VirtualHosts: []*v3routepb.VirtualHost{
+					{
+						Domains: []string{ldsTarget},
+						Routes: []*v3routepb.Route{
+							{
+								Match: &v3routepb.RouteMatch{PathSpecifier: &v3routepb.RouteMatch_Prefix{Prefix: "/"}},
+								Action: &v3routepb.Route_Route{
+									Route: &v3routepb.RouteAction{
+										ClusterSpecifier:  &v3routepb.RouteAction_Cluster{Cluster: clusterName},
+										MaxStreamDuration: &v3routepb.RouteAction_MaxStreamDuration{MaxStreamDuration: durationpb.New(2 * time.Second), GrpcTimeoutHeaderMax: durationpb.New(0)},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			wantUpdate: RouteConfigUpdate{
+				VirtualHosts: []*VirtualHost{
+					{
+						Domains: []string{ldsTarget},
+						Routes:  []*Route{{Prefix: newStringP("/"), Action: map[string]uint32{clusterName: 1}, MaxStreamDuration: 0}},
+					},
+				},
+			},
+		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			gotUpdate, gotError := generateRDSUpdateFromRouteConfiguration(test.rc, nil)
 			if (gotError != nil) != test.wantError || !cmp.Equal(gotUpdate, test.wantUpdate, cmpopts.EquateEmpty()) {
-				t.Errorf("generateRDSUpdateFromRouteConfiguration(%+v, %v) = %v, want %v", test.rc, ldsTarget, gotUpdate, test.wantUpdate)
+				t.Errorf("generateRDSUpdateFromRouteConfiguration(%+v, %v) returned unexpected, diff (-want +got):\\n%s", test.rc, ldsTarget, cmp.Diff(test.wantUpdate, gotUpdate, cmpopts.EquateEmpty()))
 			}
 		})
 	}
@@ -633,102 +587,6 @@ func (s) TestUnmarshalRouteConfig(t *testing.T) {
 	}
 }
 
-func (s) TestMatchTypeForDomain(t *testing.T) {
-	tests := []struct {
-		d    string
-		want domainMatchType
-	}{
-		{d: "", want: domainMatchTypeInvalid},
-		{d: "*", want: domainMatchTypeUniversal},
-		{d: "bar.*", want: domainMatchTypePrefix},
-		{d: "*.abc.com", want: domainMatchTypeSuffix},
-		{d: "foo.bar.com", want: domainMatchTypeExact},
-		{d: "foo.*.com", want: domainMatchTypeInvalid},
-	}
-	for _, tt := range tests {
-		if got := matchTypeForDomain(tt.d); got != tt.want {
-			t.Errorf("matchTypeForDomain(%q) = %v, want %v", tt.d, got, tt.want)
-		}
-	}
-}
-
-func (s) TestMatch(t *testing.T) {
-	tests := []struct {
-		name        string
-		domain      string
-		host        string
-		wantTyp     domainMatchType
-		wantMatched bool
-	}{
-		{name: "invalid-empty", domain: "", host: "", wantTyp: domainMatchTypeInvalid, wantMatched: false},
-		{name: "invalid", domain: "a.*.b", host: "", wantTyp: domainMatchTypeInvalid, wantMatched: false},
-		{name: "universal", domain: "*", host: "abc.com", wantTyp: domainMatchTypeUniversal, wantMatched: true},
-		{name: "prefix-match", domain: "abc.*", host: "abc.123", wantTyp: domainMatchTypePrefix, wantMatched: true},
-		{name: "prefix-no-match", domain: "abc.*", host: "abcd.123", wantTyp: domainMatchTypePrefix, wantMatched: false},
-		{name: "suffix-match", domain: "*.123", host: "abc.123", wantTyp: domainMatchTypeSuffix, wantMatched: true},
-		{name: "suffix-no-match", domain: "*.123", host: "abc.1234", wantTyp: domainMatchTypeSuffix, wantMatched: false},
-		{name: "exact-match", domain: "foo.bar", host: "foo.bar", wantTyp: domainMatchTypeExact, wantMatched: true},
-		{name: "exact-no-match", domain: "foo.bar.com", host: "foo.bar", wantTyp: domainMatchTypeExact, wantMatched: false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if gotTyp, gotMatched := match(tt.domain, tt.host); gotTyp != tt.wantTyp || gotMatched != tt.wantMatched {
-				t.Errorf("match() = %v, %v, want %v, %v", gotTyp, gotMatched, tt.wantTyp, tt.wantMatched)
-			}
-		})
-	}
-}
-
-func (s) TestFindBestMatchingVirtualHost(t *testing.T) {
-	var (
-		oneExactMatch = &VirtualHost{
-			Domains: []string{"foo.bar.com"},
-		}
-		oneSuffixMatch = &VirtualHost{
-			Domains: []string{"*.bar.com"},
-		}
-		onePrefixMatch = &VirtualHost{
-			Domains: []string{"foo.bar.*"},
-		}
-		oneUniversalMatch = &VirtualHost{
-			Domains: []string{"*"},
-		}
-		longExactMatch = &VirtualHost{
-			Domains: []string{"v2.foo.bar.com"},
-		}
-		multipleMatch = &VirtualHost{
-			Domains: []string{"pi.foo.bar.com", "314.*", "*.159"},
-		}
-		vhs = []*VirtualHost{oneExactMatch, oneSuffixMatch, onePrefixMatch, oneUniversalMatch, longExactMatch, multipleMatch}
-	)
-
-	tests := []struct {
-		name   string
-		host   string
-		vHosts []*VirtualHost
-		want   *VirtualHost
-	}{
-		{name: "exact-match", host: "foo.bar.com", vHosts: vhs, want: oneExactMatch},
-		{name: "suffix-match", host: "123.bar.com", vHosts: vhs, want: oneSuffixMatch},
-		{name: "prefix-match", host: "foo.bar.org", vHosts: vhs, want: onePrefixMatch},
-		{name: "universal-match", host: "abc.123", vHosts: vhs, want: oneUniversalMatch},
-		{name: "long-exact-match", host: "v2.foo.bar.com", vHosts: vhs, want: longExactMatch},
-		// Matches suffix "*.bar.com" and exact "pi.foo.bar.com". Takes exact.
-		{name: "multiple-match-exact", host: "pi.foo.bar.com", vHosts: vhs, want: multipleMatch},
-		// Matches suffix "*.159" and prefix "foo.bar.*". Takes suffix.
-		{name: "multiple-match-suffix", host: "foo.bar.159", vHosts: vhs, want: multipleMatch},
-		// Matches suffix "*.bar.com" and prefix "314.*". Takes suffix.
-		{name: "multiple-match-prefix", host: "314.bar.com", vHosts: vhs, want: oneSuffixMatch},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := findBestMatchingVirtualHost(tt.host, tt.vHosts); !cmp.Equal(got, tt.want, cmp.Comparer(proto.Equal)) {
-				t.Errorf("findBestMatchingVirtualHost() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
 func (s) TestRoutesProtoToSlice(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -750,8 +608,22 @@ func (s) TestRoutesProtoToSlice(t *testing.T) {
 					PathSpecifier: &v3routepb.RouteMatch_Prefix{Prefix: "/"},
 					CaseSensitive: &wrapperspb.BoolValue{Value: false},
 				},
+				Action: &v3routepb.Route_Route{
+					Route: &v3routepb.RouteAction{
+						ClusterSpecifier: &v3routepb.RouteAction_WeightedClusters{
+							WeightedClusters: &v3routepb.WeightedCluster{
+								Clusters: []*v3routepb.WeightedCluster_ClusterWeight{
+									{Name: "B", Weight: &wrapperspb.UInt32Value{Value: 60}},
+									{Name: "A", Weight: &wrapperspb.UInt32Value{Value: 40}},
+								},
+								TotalWeight: &wrapperspb.UInt32Value{Value: 100},
+							}}}},
 			}},
-			wantErr: true,
+			wantRoutes: []*Route{{
+				Prefix:          newStringP("/"),
+				CaseInsensitive: true,
+				Action:          map[string]uint32{"A": 40, "B": 60},
+			}},
 		},
 		{
 			name: "good",
