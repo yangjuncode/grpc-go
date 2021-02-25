@@ -31,13 +31,15 @@ import (
 	"github.com/golang/protobuf/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/binarylog"
-	pb "google.golang.org/grpc/binarylog/grpc_binarylog_v1"
 	"google.golang.org/grpc/grpclog"
 	iblog "google.golang.org/grpc/internal/binarylog"
 	"google.golang.org/grpc/internal/grpctest"
 	"google.golang.org/grpc/metadata"
-	testpb "google.golang.org/grpc/stats/grpc_testing"
 	"google.golang.org/grpc/status"
+
+	pb "google.golang.org/grpc/binarylog/grpc_binarylog_v1"
+	testgrpc "google.golang.org/grpc/interop/grpc_testing"
+	testpb "google.golang.org/grpc/interop/grpc_testing"
 )
 
 var grpclogLogger = grpclog.Component("binarylog")
@@ -114,8 +116,19 @@ var (
 	globalRPCID uint64 // RPC id starts with 1, but we do ++ at the beginning of each test.
 )
 
+func idToPayload(id int32) *testpb.Payload {
+	return &testpb.Payload{Body: []byte{byte(id), byte(id >> 8), byte(id >> 16), byte(id >> 24)}}
+}
+
+func payloadToID(p *testpb.Payload) int32 {
+	if p == nil || len(p.Body) != 4 {
+		panic("invalid payload")
+	}
+	return int32(p.Body[0]) + int32(p.Body[1])<<8 + int32(p.Body[2])<<16 + int32(p.Body[3])<<24
+}
+
 type testServer struct {
-	testpb.UnimplementedTestServiceServer
+	testgrpc.UnimplementedTestServiceServer
 	te *test
 }
 
@@ -130,14 +143,14 @@ func (s *testServer) UnaryCall(ctx context.Context, in *testpb.SimpleRequest) (*
 		}
 	}
 
-	if in.Id == errorID {
-		return nil, fmt.Errorf("got error id: %v", in.Id)
+	if id := payloadToID(in.Payload); id == errorID {
+		return nil, fmt.Errorf("got error id: %v", id)
 	}
 
-	return &testpb.SimpleResponse{Id: in.Id}, nil
+	return &testpb.SimpleResponse{Payload: in.Payload}, nil
 }
 
-func (s *testServer) FullDuplexCall(stream testpb.TestService_FullDuplexCallServer) error {
+func (s *testServer) FullDuplexCall(stream testgrpc.TestService_FullDuplexCallServer) error {
 	md, ok := metadata.FromIncomingContext(stream.Context())
 	if ok {
 		if err := stream.SendHeader(md); err != nil {
@@ -155,17 +168,17 @@ func (s *testServer) FullDuplexCall(stream testpb.TestService_FullDuplexCallServ
 			return err
 		}
 
-		if in.Id == errorID {
-			return fmt.Errorf("got error id: %v", in.Id)
+		if id := payloadToID(in.Payload); id == errorID {
+			return fmt.Errorf("got error id: %v", id)
 		}
 
-		if err := stream.Send(&testpb.SimpleResponse{Id: in.Id}); err != nil {
+		if err := stream.Send(&testpb.StreamingOutputCallResponse{Payload: in.Payload}); err != nil {
 			return err
 		}
 	}
 }
 
-func (s *testServer) ClientStreamCall(stream testpb.TestService_ClientStreamCallServer) error {
+func (s *testServer) StreamingInputCall(stream testgrpc.TestService_StreamingInputCallServer) error {
 	md, ok := metadata.FromIncomingContext(stream.Context())
 	if ok {
 		if err := stream.SendHeader(md); err != nil {
@@ -177,19 +190,19 @@ func (s *testServer) ClientStreamCall(stream testpb.TestService_ClientStreamCall
 		in, err := stream.Recv()
 		if err == io.EOF {
 			// read done.
-			return stream.SendAndClose(&testpb.SimpleResponse{Id: int32(0)})
+			return stream.SendAndClose(&testpb.StreamingInputCallResponse{AggregatedPayloadSize: 0})
 		}
 		if err != nil {
 			return err
 		}
 
-		if in.Id == errorID {
-			return fmt.Errorf("got error id: %v", in.Id)
+		if id := payloadToID(in.Payload); id == errorID {
+			return fmt.Errorf("got error id: %v", id)
 		}
 	}
 }
 
-func (s *testServer) ServerStreamCall(in *testpb.SimpleRequest, stream testpb.TestService_ServerStreamCallServer) error {
+func (s *testServer) StreamingOutputCall(in *testpb.StreamingOutputCallRequest, stream testgrpc.TestService_StreamingOutputCallServer) error {
 	md, ok := metadata.FromIncomingContext(stream.Context())
 	if ok {
 		if err := stream.SendHeader(md); err != nil {
@@ -198,12 +211,12 @@ func (s *testServer) ServerStreamCall(in *testpb.SimpleRequest, stream testpb.Te
 		stream.SetTrailer(testTrailerMetadata)
 	}
 
-	if in.Id == errorID {
-		return fmt.Errorf("got error id: %v", in.Id)
+	if id := payloadToID(in.Payload); id == errorID {
+		return fmt.Errorf("got error id: %v", id)
 	}
 
 	for i := 0; i < 5; i++ {
-		if err := stream.Send(&testpb.SimpleResponse{Id: in.Id}); err != nil {
+		if err := stream.Send(&testpb.StreamingOutputCallResponse{Payload: in.Payload}); err != nil {
 			return err
 		}
 	}
@@ -216,7 +229,7 @@ func (s *testServer) ServerStreamCall(in *testpb.SimpleRequest, stream testpb.Te
 type test struct {
 	t *testing.T
 
-	testService testpb.TestServiceServer // nil means none
+	testService testgrpc.TestServiceServer // nil means none
 	// srv and srvAddr are set once startServer is called.
 	srv     *grpc.Server
 	srvAddr string // Server IP without port.
@@ -271,7 +284,7 @@ func (lw *listenerWrapper) Accept() (net.Conn, error) {
 
 // startServer starts a gRPC server listening. Callers should defer a
 // call to te.tearDown to clean up.
-func (te *test) startServer(ts testpb.TestServiceServer) {
+func (te *test) startServer(ts testgrpc.TestServiceServer) {
 	te.testService = ts
 	lis, err := net.Listen("tcp", "localhost:0")
 
@@ -287,7 +300,7 @@ func (te *test) startServer(ts testpb.TestServiceServer) {
 	s := grpc.NewServer(opts...)
 	te.srv = s
 	if te.testService != nil {
-		testpb.RegisterTestServiceServer(s, te.testService)
+		testgrpc.RegisterTestServiceServer(s, te.testService)
 	}
 
 	go s.Serve(lis)
@@ -332,11 +345,11 @@ func (te *test) doUnaryCall(c *rpcConfig) (*testpb.SimpleRequest, *testpb.Simple
 		req  *testpb.SimpleRequest
 		err  error
 	)
-	tc := testpb.NewTestServiceClient(te.clientConn())
+	tc := testgrpc.NewTestServiceClient(te.clientConn())
 	if c.success {
-		req = &testpb.SimpleRequest{Id: errorID + 1}
+		req = &testpb.SimpleRequest{Payload: idToPayload(errorID + 1)}
 	} else {
-		req = &testpb.SimpleRequest{Id: errorID}
+		req = &testpb.SimpleRequest{Payload: idToPayload(errorID)}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -346,13 +359,13 @@ func (te *test) doUnaryCall(c *rpcConfig) (*testpb.SimpleRequest, *testpb.Simple
 	return req, resp, err
 }
 
-func (te *test) doFullDuplexCallRoundtrip(c *rpcConfig) ([]*testpb.SimpleRequest, []*testpb.SimpleResponse, error) {
+func (te *test) doFullDuplexCallRoundtrip(c *rpcConfig) ([]proto.Message, []proto.Message, error) {
 	var (
-		reqs  []*testpb.SimpleRequest
-		resps []*testpb.SimpleResponse
+		reqs  []proto.Message
+		resps []proto.Message
 		err   error
 	)
-	tc := testpb.NewTestServiceClient(te.clientConn())
+	tc := testgrpc.NewTestServiceClient(te.clientConn())
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	ctx = metadata.NewOutgoingContext(ctx, testMetadata)
@@ -372,14 +385,14 @@ func (te *test) doFullDuplexCallRoundtrip(c *rpcConfig) ([]*testpb.SimpleRequest
 		startID = errorID
 	}
 	for i := 0; i < c.count; i++ {
-		req := &testpb.SimpleRequest{
-			Id: int32(i) + startID,
+		req := &testpb.StreamingOutputCallRequest{
+			Payload: idToPayload(int32(i) + startID),
 		}
 		reqs = append(reqs, req)
 		if err = stream.Send(req); err != nil {
 			return reqs, resps, err
 		}
-		var resp *testpb.SimpleResponse
+		var resp *testpb.StreamingOutputCallResponse
 		if resp, err = stream.Recv(); err != nil {
 			return reqs, resps, err
 		}
@@ -395,18 +408,18 @@ func (te *test) doFullDuplexCallRoundtrip(c *rpcConfig) ([]*testpb.SimpleRequest
 	return reqs, resps, nil
 }
 
-func (te *test) doClientStreamCall(c *rpcConfig) ([]*testpb.SimpleRequest, *testpb.SimpleResponse, error) {
+func (te *test) doClientStreamCall(c *rpcConfig) ([]proto.Message, proto.Message, error) {
 	var (
-		reqs []*testpb.SimpleRequest
-		resp *testpb.SimpleResponse
+		reqs []proto.Message
+		resp *testpb.StreamingInputCallResponse
 		err  error
 	)
-	tc := testpb.NewTestServiceClient(te.clientConn())
+	tc := testgrpc.NewTestServiceClient(te.clientConn())
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	ctx = metadata.NewOutgoingContext(ctx, testMetadata)
 
-	stream, err := tc.ClientStreamCall(ctx)
+	stream, err := tc.StreamingInputCall(ctx)
 	if err != nil {
 		return reqs, resp, err
 	}
@@ -415,8 +428,8 @@ func (te *test) doClientStreamCall(c *rpcConfig) ([]*testpb.SimpleRequest, *test
 		startID = errorID
 	}
 	for i := 0; i < c.count; i++ {
-		req := &testpb.SimpleRequest{
-			Id: int32(i) + startID,
+		req := &testpb.StreamingInputCallRequest{
+			Payload: idToPayload(int32(i) + startID),
 		}
 		reqs = append(reqs, req)
 		if err = stream.Send(req); err != nil {
@@ -427,14 +440,14 @@ func (te *test) doClientStreamCall(c *rpcConfig) ([]*testpb.SimpleRequest, *test
 	return reqs, resp, err
 }
 
-func (te *test) doServerStreamCall(c *rpcConfig) (*testpb.SimpleRequest, []*testpb.SimpleResponse, error) {
+func (te *test) doServerStreamCall(c *rpcConfig) (proto.Message, []proto.Message, error) {
 	var (
-		req   *testpb.SimpleRequest
-		resps []*testpb.SimpleResponse
+		req   *testpb.StreamingOutputCallRequest
+		resps []proto.Message
 		err   error
 	)
 
-	tc := testpb.NewTestServiceClient(te.clientConn())
+	tc := testgrpc.NewTestServiceClient(te.clientConn())
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	ctx = metadata.NewOutgoingContext(ctx, testMetadata)
@@ -443,13 +456,13 @@ func (te *test) doServerStreamCall(c *rpcConfig) (*testpb.SimpleRequest, []*test
 	if !c.success {
 		startID = errorID
 	}
-	req = &testpb.SimpleRequest{Id: startID}
-	stream, err := tc.ServerStreamCall(ctx, req)
+	req = &testpb.StreamingOutputCallRequest{Payload: idToPayload(startID)}
+	stream, err := tc.StreamingOutputCall(ctx, req)
 	if err != nil {
 		return req, resps, err
 	}
 	for {
-		var resp *testpb.SimpleResponse
+		var resp *testpb.StreamingOutputCallResponse
 		resp, err := stream.Recv()
 		if err == io.EOF {
 			return req, resps, nil
@@ -465,8 +478,8 @@ type expectedData struct {
 	cc *rpcConfig
 
 	method    string
-	requests  []*testpb.SimpleRequest
-	responses []*testpb.SimpleResponse
+	requests  []proto.Message
+	responses []proto.Message
 	err       error
 }
 
@@ -534,7 +547,7 @@ func (ed *expectedData) newServerHeaderEntry(client bool, rpcID, inRPCID uint64)
 	}
 }
 
-func (ed *expectedData) newClientMessageEntry(client bool, rpcID, inRPCID uint64, msg *testpb.SimpleRequest) *pb.GrpcLogEntry {
+func (ed *expectedData) newClientMessageEntry(client bool, rpcID, inRPCID uint64, msg proto.Message) *pb.GrpcLogEntry {
 	logger := pb.GrpcLogEntry_LOGGER_CLIENT
 	if !client {
 		logger = pb.GrpcLogEntry_LOGGER_SERVER
@@ -558,7 +571,7 @@ func (ed *expectedData) newClientMessageEntry(client bool, rpcID, inRPCID uint64
 	}
 }
 
-func (ed *expectedData) newServerMessageEntry(client bool, rpcID, inRPCID uint64, msg *testpb.SimpleResponse) *pb.GrpcLogEntry {
+func (ed *expectedData) newServerMessageEntry(client bool, rpcID, inRPCID uint64, msg proto.Message) *pb.GrpcLogEntry {
 	logger := pb.GrpcLogEntry_LOGGER_CLIENT
 	if !client {
 		logger = pb.GrpcLogEntry_LOGGER_SERVER
@@ -795,20 +808,20 @@ func runRPCs(t *testing.T, tc *testConfig, cc *rpcConfig) *expectedData {
 	case unaryRPC:
 		expect.method = "/grpc.testing.TestService/UnaryCall"
 		req, resp, err := te.doUnaryCall(cc)
-		expect.requests = []*testpb.SimpleRequest{req}
-		expect.responses = []*testpb.SimpleResponse{resp}
+		expect.requests = []proto.Message{req}
+		expect.responses = []proto.Message{resp}
 		expect.err = err
 	case clientStreamRPC:
-		expect.method = "/grpc.testing.TestService/ClientStreamCall"
+		expect.method = "/grpc.testing.TestService/StreamingInputCall"
 		reqs, resp, err := te.doClientStreamCall(cc)
 		expect.requests = reqs
-		expect.responses = []*testpb.SimpleResponse{resp}
+		expect.responses = []proto.Message{resp}
 		expect.err = err
 	case serverStreamRPC:
-		expect.method = "/grpc.testing.TestService/ServerStreamCall"
+		expect.method = "/grpc.testing.TestService/StreamingOutputCall"
 		req, resps, err := te.doServerStreamCall(cc)
 		expect.responses = resps
-		expect.requests = []*testpb.SimpleRequest{req}
+		expect.requests = []proto.Message{req}
 		expect.err = err
 	case fullDuplexStreamRPC, cancelRPC:
 		expect.method = "/grpc.testing.TestService/FullDuplexCall"

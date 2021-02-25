@@ -40,6 +40,9 @@ echo "go install cmd/protoc-gen-go-grpc"
 echo "git clone https://github.com/grpc/grpc-proto"
 git clone --quiet https://github.com/grpc/grpc-proto ${WORKDIR}/grpc-proto
 
+echo "git clone https://github.com/protocolbuffers/protobuf"
+git clone --quiet https://github.com/protocolbuffers/protobuf ${WORKDIR}/protobuf
+
 # Pull in code.proto as a proto dependency
 mkdir -p ${WORKDIR}/googleapis/google/rpc
 echo "curl https://raw.githubusercontent.com/googleapis/googleapis/master/google/rpc/code.proto"
@@ -71,13 +74,15 @@ SOURCES=(
   ${WORKDIR}/grpc-proto/grpc/lookup/v1/rls.proto
   ${WORKDIR}/grpc-proto/grpc/lookup/v1/rls_config.proto
   ${WORKDIR}/grpc-proto/grpc/service_config/service_config.proto
+  ${WORKDIR}/grpc-proto/grpc/testing/*.proto
+  ${WORKDIR}/grpc-proto/grpc/core/*.proto
   ${WORKDIR}/istio/istio/google/security/meshca/v1/meshca.proto
 )
 
 # These options of the form 'Mfoo.proto=bar' instruct the codegen to use an
 # import path of 'bar' in the generated code when 'foo.proto' is imported in
 # one of the sources.
-OPTS=Mgrpc/service_config/service_config.proto=/internal/proto/grpc_service_config
+OPTS=Mgrpc/service_config/service_config.proto=/internal/proto/grpc_service_config,Mgrpc/core/stats.proto=google.golang.org/grpc/interop/grpc_testing/core
 
 for src in ${SOURCES[@]}; do
   echo "protoc ${src}"
@@ -85,6 +90,7 @@ for src in ${SOURCES[@]}; do
     -I"." \
     -I${WORKDIR}/grpc-proto \
     -I${WORKDIR}/googleapis \
+    -I${WORKDIR}/protobuf/src \
     -I${WORKDIR}/istio \
     ${src}
 done
@@ -95,6 +101,7 @@ for src in ${LEGACY_SOURCES[@]}; do
     -I"." \
     -I${WORKDIR}/grpc-proto \
     -I${WORKDIR}/googleapis \
+    -I${WORKDIR}/protobuf/src \
     -I${WORKDIR}/istio \
     ${src}
 done
@@ -110,6 +117,10 @@ rm ${WORKDIR}/out/google.golang.org/grpc/reflection/grpc_testingv3/*.pb.go
 
 # grpc/service_config/service_config.proto does not have a go_package option.
 mv ${WORKDIR}/out/grpc/service_config/service_config.pb.go internal/proto/grpc_service_config
+
+# grpc/testing does not have a go_package option.
+mv ${WORKDIR}/out/grpc/testing/*.pb.go interop/grpc_testing/
+mv ${WORKDIR}/out/grpc/core/*.pb.go interop/grpc_testing/core/
 
 # istio/google/security/meshca/v1/meshca.proto does not have a go_package option.
 mkdir -p ${WORKDIR}/out/google.golang.org/grpc/credentials/tls/certprovider/meshca/internal/v1/

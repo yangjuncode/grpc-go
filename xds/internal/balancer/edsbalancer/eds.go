@@ -48,8 +48,8 @@ type xdsClientInterface interface {
 }
 
 var (
-	newEDSBalancer = func(cc balancer.ClientConn, enqueueState func(priorityType, balancer.State), lw load.PerClusterReporter, logger *grpclog.PrefixLogger) edsBalancerImplInterface {
-		return newEDSBalancerImpl(cc, enqueueState, lw, logger)
+	newEDSBalancer = func(cc balancer.ClientConn, opts balancer.BuildOptions, enqueueState func(priorityType, balancer.State), lw load.PerClusterReporter, logger *grpclog.PrefixLogger) edsBalancerImplInterface {
+		return newEDSBalancerImpl(cc, opts, enqueueState, lw, logger)
 	}
 	newXDSClient = func() (xdsClientInterface, error) { return xdsclient.New() }
 )
@@ -61,7 +61,7 @@ func init() {
 type edsBalancerBuilder struct{}
 
 // Build helps implement the balancer.Builder interface.
-func (b *edsBalancerBuilder) Build(cc balancer.ClientConn, _ balancer.BuildOptions) balancer.Balancer {
+func (b *edsBalancerBuilder) Build(cc balancer.ClientConn, opts balancer.BuildOptions) balancer.Balancer {
 	x := &edsBalancer{
 		cc:                cc,
 		closed:            grpcsync.NewEvent(),
@@ -80,7 +80,7 @@ func (b *edsBalancerBuilder) Build(cc balancer.ClientConn, _ balancer.BuildOptio
 	}
 
 	x.xdsClient = client
-	x.edsImpl = newEDSBalancer(x.cc, x.enqueueChildBalancerState, x.lsw, x.logger)
+	x.edsImpl = newEDSBalancer(x.cc, opts, x.enqueueChildBalancerState, x.lsw, x.logger)
 	x.logger.Infof("Created")
 	go x.run()
 	return x
@@ -113,9 +113,9 @@ type edsBalancerImplInterface interface {
 	handleSubConnStateChange(sc balancer.SubConn, state connectivity.State)
 	// updateState handle a balancer state update from the priority.
 	updateState(priority priorityType, s balancer.State)
-	// updateServiceRequestsCounter updates the service requests counter to the
+	// updateServiceRequestsConfig updates the service requests counter to the
 	// one for the given service name.
-	updateServiceRequestsCounter(serviceName string)
+	updateServiceRequestsConfig(serviceName string, max *uint32)
 	// close closes the eds balancer.
 	close()
 }
@@ -215,7 +215,7 @@ func (x *edsBalancer) handleGRPCUpdate(update interface{}) {
 			x.logger.Warningf("failed to update xDS client: %v", err)
 		}
 
-		x.edsImpl.updateServiceRequestsCounter(cfg.EDSServiceName)
+		x.edsImpl.updateServiceRequestsConfig(cfg.EDSServiceName, cfg.MaxConcurrentRequests)
 
 		// We will update the edsImpl with the new child policy, if we got a
 		// different one.

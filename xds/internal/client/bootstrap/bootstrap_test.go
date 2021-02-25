@@ -264,19 +264,66 @@ func (c *Config) compare(want *Config) error {
 	return nil
 }
 
+func fileReadFromFileMap(bootstrapFileMap map[string]string, name string) ([]byte, error) {
+	if b, ok := bootstrapFileMap[name]; ok {
+		return []byte(b), nil
+	}
+	return nil, os.ErrNotExist
+}
+
 func setupBootstrapOverride(bootstrapFileMap map[string]string) func() {
 	oldFileReadFunc := bootstrapFileReadFunc
-	bootstrapFileReadFunc = func(name string) ([]byte, error) {
-		if b, ok := bootstrapFileMap[name]; ok {
-			return []byte(b), nil
-		}
-		return nil, os.ErrNotExist
+	bootstrapFileReadFunc = func(filename string) ([]byte, error) {
+		return fileReadFromFileMap(bootstrapFileMap, filename)
 	}
 	return func() { bootstrapFileReadFunc = oldFileReadFunc }
 }
 
 // TODO: enable leak check for this package when
 // https://github.com/googleapis/google-cloud-go/issues/2417 is fixed.
+
+// This function overrides the bootstrap file NAME env variable, to test the
+// code that reads file with the given fileName.
+func testNewConfigWithFileNameEnv(t *testing.T, fileName string, wantError bool, wantConfig *Config) {
+	origBootstrapFileName := env.BootstrapFileName
+	env.BootstrapFileName = fileName
+	defer func() { env.BootstrapFileName = origBootstrapFileName }()
+
+	c, err := NewConfig()
+	if (err != nil) != wantError {
+		t.Fatalf("NewConfig() returned error %v, wantError: %v", err, wantError)
+	}
+	if wantError {
+		return
+	}
+	if err := c.compare(wantConfig); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// This function overrides the bootstrap file CONTENT env variable, to test the
+// code that uses the content from env directly.
+func testNewConfigWithFileContentEnv(t *testing.T, fileName string, wantError bool, wantConfig *Config) {
+	b, err := bootstrapFileReadFunc(fileName)
+	if err != nil {
+		// If file reading failed, skip this test.
+		return
+	}
+	origBootstrapContent := env.BootstrapFileContent
+	env.BootstrapFileContent = string(b)
+	defer func() { env.BootstrapFileContent = origBootstrapContent }()
+
+	c, err := NewConfig()
+	if (err != nil) != wantError {
+		t.Fatalf("NewConfig() returned error %v, wantError: %v", err, wantError)
+	}
+	if wantError {
+		return
+	}
+	if err := c.compare(wantConfig); err != nil {
+		t.Fatal(err)
+	}
+}
 
 // TestNewConfigV2ProtoFailure exercises the functionality in NewConfig with
 // different bootstrap file contents which are expected to fail.
@@ -338,13 +385,8 @@ func TestNewConfigV2ProtoFailure(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			origBootstrapFileName := env.BootstrapFileName
-			env.BootstrapFileName = test.name
-			defer func() { env.BootstrapFileName = origBootstrapFileName }()
-
-			if _, err := NewConfig(); err == nil {
-				t.Fatalf("NewConfig() returned nil error, expected to fail")
-			}
+			testNewConfigWithFileNameEnv(t, test.name, true, nil)
+			testNewConfigWithFileContentEnv(t, test.name, true, nil)
 		})
 	}
 }
@@ -382,67 +424,16 @@ func TestNewConfigV2ProtoSuccess(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			origBootstrapFileName := env.BootstrapFileName
-			env.BootstrapFileName = test.name
-			defer func() { env.BootstrapFileName = origBootstrapFileName }()
-
-			c, err := NewConfig()
-			if err != nil {
-				t.Fatalf("NewConfig() failed: %v", err)
-			}
-			if err := c.compare(test.wantConfig); err != nil {
-				t.Fatal(err)
-			}
+			testNewConfigWithFileNameEnv(t, test.name, false, test.wantConfig)
+			testNewConfigWithFileContentEnv(t, test.name, false, test.wantConfig)
 		})
 	}
 }
 
-// TestNewConfigV3SupportNotEnabledOnClient verifies bootstrap functionality
-// when the GRPC_XDS_EXPERIMENTAL_V3_SUPPORT environment variable is not enabled
-// on the client. In this case, whether the server supports v3 or not, the
-// client will end up using v2.
-func TestNewConfigV3SupportNotEnabledOnClient(t *testing.T) {
-	origV3Support := env.V3Support
-	env.V3Support = false
-	defer func() { env.V3Support = origV3Support }()
-
-	cancel := setupBootstrapOverride(v3BootstrapFileMap)
-	defer cancel()
-
-	tests := []struct {
-		name       string
-		wantConfig *Config
-	}{
-		{"serverDoesNotSupportsV3", nonNilCredsConfigV2},
-		{"serverSupportsV3", nonNilCredsConfigV2},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			origBootstrapFileName := env.BootstrapFileName
-			env.BootstrapFileName = test.name
-			defer func() { env.BootstrapFileName = origBootstrapFileName }()
-
-			c, err := NewConfig()
-			if err != nil {
-				t.Fatalf("NewConfig() failed: %v", err)
-			}
-			if err := c.compare(test.wantConfig); err != nil {
-				t.Fatal(err)
-			}
-		})
-	}
-}
-
-// TestNewConfigV3SupportEnabledOnClient verifies bootstrap functionality when
-// the GRPC_XDS_EXPERIMENTAL_V3_SUPPORT environment variable is enabled on the
-// client. Here the client ends up using v2 or v3 based on what the server
-// supports.
-func TestNewConfigV3SupportEnabledOnClient(t *testing.T) {
-	origV3Support := env.V3Support
-	env.V3Support = true
-	defer func() { env.V3Support = origV3Support }()
-
+// TestNewConfigV3Support verifies bootstrap functionality involving support for
+// the xDS v3 transport protocol. Here the client ends up using v2 or v3 based
+// on what the server supports.
+func TestNewConfigV3Support(t *testing.T) {
 	cancel := setupBootstrapOverride(v3BootstrapFileMap)
 	defer cancel()
 
@@ -456,30 +447,62 @@ func TestNewConfigV3SupportEnabledOnClient(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			origBootstrapFileName := env.BootstrapFileName
-			env.BootstrapFileName = test.name
-			defer func() { env.BootstrapFileName = origBootstrapFileName }()
-
-			c, err := NewConfig()
-			if err != nil {
-				t.Fatalf("NewConfig() failed: %v", err)
-			}
-			if err := c.compare(test.wantConfig); err != nil {
-				t.Fatal(err)
-			}
+			testNewConfigWithFileNameEnv(t, test.name, false, test.wantConfig)
+			testNewConfigWithFileContentEnv(t, test.name, false, test.wantConfig)
 		})
 	}
 }
 
-// TestNewConfigBootstrapFileEnvNotSet tests the case where the bootstrap file
+// TestNewConfigBootstrapEnvPriority tests that the two env variables are read
+// in correct priority.
+//
+// the case where the bootstrap file
 // environment variable is not set.
-func TestNewConfigBootstrapFileEnvNotSet(t *testing.T) {
+func TestNewConfigBootstrapEnvPriority(t *testing.T) {
+	oldFileReadFunc := bootstrapFileReadFunc
+	bootstrapFileReadFunc = func(filename string) ([]byte, error) {
+		return fileReadFromFileMap(v2BootstrapFileMap, filename)
+	}
+	defer func() { bootstrapFileReadFunc = oldFileReadFunc }()
+
+	goodFileName1 := "goodBootstrap"
+	goodConfig1 := nonNilCredsConfigV2
+
+	goodFileName2 := "serverSupportsV3"
+	goodFileContent2 := v3BootstrapFileMap[goodFileName2]
+	goodConfig2 := nonNilCredsConfigV3
+
 	origBootstrapFileName := env.BootstrapFileName
 	env.BootstrapFileName = ""
 	defer func() { env.BootstrapFileName = origBootstrapFileName }()
 
+	origBootstrapContent := env.BootstrapFileContent
+	env.BootstrapFileContent = ""
+	defer func() { env.BootstrapFileContent = origBootstrapContent }()
+
+	// When both env variables are empty, NewConfig should fail.
 	if _, err := NewConfig(); err == nil {
 		t.Errorf("NewConfig() returned nil error, expected to fail")
+	}
+
+	// When one of them is set, it should be used.
+	env.BootstrapFileName = goodFileName1
+	env.BootstrapFileContent = ""
+	if c, err := NewConfig(); err != nil || c.compare(goodConfig1) != nil {
+		t.Errorf("NewConfig() = %v, %v, want: %v, %v", c, err, goodConfig1, nil)
+	}
+
+	env.BootstrapFileName = ""
+	env.BootstrapFileContent = goodFileContent2
+	if c, err := NewConfig(); err != nil || c.compare(goodConfig2) != nil {
+		t.Errorf("NewConfig() = %v, %v, want: %v, %v", c, err, goodConfig1, nil)
+	}
+
+	// Set both, file name should be read.
+	env.BootstrapFileName = goodFileName1
+	env.BootstrapFileContent = goodFileContent2
+	if c, err := NewConfig(); err != nil || c.compare(goodConfig1) != nil {
+		t.Errorf("NewConfig() = %v, %v, want: %v, %v", c, err, goodConfig1, nil)
 	}
 }
 
@@ -643,10 +666,6 @@ func TestNewConfigWithCertificateProviders(t *testing.T) {
 		t.Fatalf("config parsing for plugin %q failed: %v", fakeCertProviderName, err)
 	}
 
-	origV3Support := env.V3Support
-	env.V3Support = true
-	defer func() { env.V3Support = origV3Support }()
-
 	cancel := setupBootstrapOverride(bootstrapFileMap)
 	defer cancel()
 
@@ -686,20 +705,8 @@ func TestNewConfigWithCertificateProviders(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			origBootstrapFileName := env.BootstrapFileName
-			env.BootstrapFileName = test.name
-			defer func() { env.BootstrapFileName = origBootstrapFileName }()
-
-			c, err := NewConfig()
-			if (err != nil) != test.wantErr {
-				t.Fatalf("NewConfig() returned: %v, wantErr: %v", err, test.wantErr)
-			}
-			if test.wantErr {
-				return
-			}
-			if err := c.compare(test.wantConfig); err != nil {
-				t.Fatal(err)
-			}
+			testNewConfigWithFileNameEnv(t, test.name, test.wantErr, test.wantConfig)
+			testNewConfigWithFileContentEnv(t, test.name, test.wantErr, test.wantConfig)
 		})
 	}
 }
@@ -764,20 +771,8 @@ func TestNewConfigWithServerResourceNameID(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			origBootstrapFileName := env.BootstrapFileName
-			env.BootstrapFileName = test.name
-			defer func() { env.BootstrapFileName = origBootstrapFileName }()
-
-			c, err := NewConfig()
-			if (err != nil) != test.wantErr {
-				t.Fatalf("NewConfig() returned (%+v, %v), wantErr: %v", c, err, test.wantErr)
-			}
-			if test.wantErr {
-				return
-			}
-			if err := c.compare(test.wantConfig); err != nil {
-				t.Fatal(err)
-			}
+			testNewConfigWithFileNameEnv(t, test.name, test.wantErr, test.wantConfig)
+			testNewConfigWithFileContentEnv(t, test.name, test.wantErr, test.wantConfig)
 		})
 	}
 }
