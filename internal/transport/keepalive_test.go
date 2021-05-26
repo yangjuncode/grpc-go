@@ -24,6 +24,7 @@ package transport
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"testing"
@@ -47,7 +48,7 @@ func (s) TestMaxConnectionIdle(t *testing.T) {
 	}
 	server, client, cancel := setUpWithOptions(t, 0, serverConfig, suspended, ConnectOptions{})
 	defer func() {
-		client.Close()
+		client.Close(fmt.Errorf("closed manually by test"))
 		server.stop()
 		cancel()
 	}()
@@ -68,7 +69,7 @@ func (s) TestMaxConnectionIdle(t *testing.T) {
 		if !timeout.Stop() {
 			<-timeout.C
 		}
-		if reason := client.GetGoAwayReason(); reason != GoAwayNoReason {
+		if reason, _ := client.GetGoAwayReason(); reason != GoAwayNoReason {
 			t.Fatalf("GoAwayReason is %v, want %v", reason, GoAwayNoReason)
 		}
 	case <-timeout.C:
@@ -86,7 +87,7 @@ func (s) TestMaxConnectionIdleBusyClient(t *testing.T) {
 	}
 	server, client, cancel := setUpWithOptions(t, 0, serverConfig, suspended, ConnectOptions{})
 	defer func() {
-		client.Close()
+		client.Close(fmt.Errorf("closed manually by test"))
 		server.stop()
 		cancel()
 	}()
@@ -122,7 +123,7 @@ func (s) TestMaxConnectionAge(t *testing.T) {
 	}
 	server, client, cancel := setUpWithOptions(t, 0, serverConfig, suspended, ConnectOptions{})
 	defer func() {
-		client.Close()
+		client.Close(fmt.Errorf("closed manually by test"))
 		server.stop()
 		cancel()
 	}()
@@ -142,7 +143,7 @@ func (s) TestMaxConnectionAge(t *testing.T) {
 		if !timeout.Stop() {
 			<-timeout.C
 		}
-		if reason := client.GetGoAwayReason(); reason != GoAwayNoReason {
+		if reason, _ := client.GetGoAwayReason(); reason != GoAwayNoReason {
 			t.Fatalf("GoAwayReason is %v, want %v", reason, GoAwayNoReason)
 		}
 	case <-timeout.C:
@@ -169,7 +170,7 @@ func (s) TestKeepaliveServerClosesUnresponsiveClient(t *testing.T) {
 	}
 	server, client, cancel := setUpWithOptions(t, 0, serverConfig, suspended, ConnectOptions{})
 	defer func() {
-		client.Close()
+		client.Close(fmt.Errorf("closed manually by test"))
 		server.stop()
 		cancel()
 	}()
@@ -192,7 +193,7 @@ func (s) TestKeepaliveServerClosesUnresponsiveClient(t *testing.T) {
 
 	// We read from the net.Conn till we get an error, which is expected when
 	// the server closes the connection as part of the keepalive logic.
-	errCh := make(chan error)
+	errCh := make(chan error, 1)
 	go func() {
 		b := make([]byte, 24)
 		for {
@@ -228,7 +229,7 @@ func (s) TestKeepaliveServerWithResponsiveClient(t *testing.T) {
 	}
 	server, client, cancel := setUpWithOptions(t, 0, serverConfig, suspended, ConnectOptions{})
 	defer func() {
-		client.Close()
+		client.Close(fmt.Errorf("closed manually by test"))
 		server.stop()
 		cancel()
 	}()
@@ -257,7 +258,7 @@ func (s) TestKeepaliveClientClosesUnresponsiveServer(t *testing.T) {
 		PermitWithoutStream: true,
 	}}, connCh)
 	defer cancel()
-	defer client.Close()
+	defer client.Close(fmt.Errorf("closed manually by test"))
 
 	conn, ok := <-connCh
 	if !ok {
@@ -288,7 +289,7 @@ func (s) TestKeepaliveClientOpenWithUnresponsiveServer(t *testing.T) {
 		Timeout: 1 * time.Second,
 	}}, connCh)
 	defer cancel()
-	defer client.Close()
+	defer client.Close(fmt.Errorf("closed manually by test"))
 
 	conn, ok := <-connCh
 	if !ok {
@@ -317,7 +318,7 @@ func (s) TestKeepaliveClientClosesWithActiveStreams(t *testing.T) {
 		Timeout: 1 * time.Second,
 	}}, connCh)
 	defer cancel()
-	defer client.Close()
+	defer client.Close(fmt.Errorf("closed manually by test"))
 
 	conn, ok := <-connCh
 	if !ok {
@@ -345,14 +346,21 @@ func (s) TestKeepaliveClientClosesWithActiveStreams(t *testing.T) {
 // responds to keepalive pings, and makes sure than a client transport stays
 // healthy without any active streams.
 func (s) TestKeepaliveClientStaysHealthyWithResponsiveServer(t *testing.T) {
-	server, client, cancel := setUpWithOptions(t, 0, &ServerConfig{}, normal, ConnectOptions{
-		KeepaliveParams: keepalive.ClientParameters{
-			Time:                1 * time.Second,
-			Timeout:             1 * time.Second,
-			PermitWithoutStream: true,
-		}})
+	server, client, cancel := setUpWithOptions(t, 0,
+		&ServerConfig{
+			KeepalivePolicy: keepalive.EnforcementPolicy{
+				PermitWithoutStream: true,
+			},
+		},
+		normal,
+		ConnectOptions{
+			KeepaliveParams: keepalive.ClientParameters{
+				Time:                1 * time.Second,
+				Timeout:             1 * time.Second,
+				PermitWithoutStream: true,
+			}})
 	defer func() {
-		client.Close()
+		client.Close(fmt.Errorf("closed manually by test"))
 		server.stop()
 		cancel()
 	}()
@@ -391,7 +399,7 @@ func (s) TestKeepaliveClientFrequency(t *testing.T) {
 	}
 	server, client, cancel := setUpWithOptions(t, 0, serverConfig, normal, clientOptions)
 	defer func() {
-		client.Close()
+		client.Close(fmt.Errorf("closed manually by test"))
 		server.stop()
 		cancel()
 	}()
@@ -402,7 +410,7 @@ func (s) TestKeepaliveClientFrequency(t *testing.T) {
 		if !timeout.Stop() {
 			<-timeout.C
 		}
-		if reason := client.GetGoAwayReason(); reason != GoAwayTooManyPings {
+		if reason, _ := client.GetGoAwayReason(); reason != GoAwayTooManyPings {
 			t.Fatalf("GoAwayReason is %v, want %v", reason, GoAwayTooManyPings)
 		}
 	case <-timeout.C:
@@ -436,7 +444,7 @@ func (s) TestKeepaliveServerEnforcementWithAbusiveClientNoRPC(t *testing.T) {
 	}
 	server, client, cancel := setUpWithOptions(t, 0, serverConfig, normal, clientOptions)
 	defer func() {
-		client.Close()
+		client.Close(fmt.Errorf("closed manually by test"))
 		server.stop()
 		cancel()
 	}()
@@ -447,7 +455,7 @@ func (s) TestKeepaliveServerEnforcementWithAbusiveClientNoRPC(t *testing.T) {
 		if !timeout.Stop() {
 			<-timeout.C
 		}
-		if reason := client.GetGoAwayReason(); reason != GoAwayTooManyPings {
+		if reason, _ := client.GetGoAwayReason(); reason != GoAwayTooManyPings {
 			t.Fatalf("GoAwayReason is %v, want %v", reason, GoAwayTooManyPings)
 		}
 	case <-timeout.C:
@@ -480,7 +488,7 @@ func (s) TestKeepaliveServerEnforcementWithAbusiveClientWithRPC(t *testing.T) {
 	}
 	server, client, cancel := setUpWithOptions(t, 0, serverConfig, suspended, clientOptions)
 	defer func() {
-		client.Close()
+		client.Close(fmt.Errorf("closed manually by test"))
 		server.stop()
 		cancel()
 	}()
@@ -497,7 +505,7 @@ func (s) TestKeepaliveServerEnforcementWithAbusiveClientWithRPC(t *testing.T) {
 		if !timeout.Stop() {
 			<-timeout.C
 		}
-		if reason := client.GetGoAwayReason(); reason != GoAwayTooManyPings {
+		if reason, _ := client.GetGoAwayReason(); reason != GoAwayTooManyPings {
 			t.Fatalf("GoAwayReason is %v, want %v", reason, GoAwayTooManyPings)
 		}
 	case <-timeout.C:
@@ -530,7 +538,7 @@ func (s) TestKeepaliveServerEnforcementWithObeyingClientNoRPC(t *testing.T) {
 	}
 	server, client, cancel := setUpWithOptions(t, 0, serverConfig, normal, clientOptions)
 	defer func() {
-		client.Close()
+		client.Close(fmt.Errorf("closed manually by test"))
 		server.stop()
 		cancel()
 	}()
@@ -564,7 +572,7 @@ func (s) TestKeepaliveServerEnforcementWithObeyingClientWithRPC(t *testing.T) {
 	}
 	server, client, cancel := setUpWithOptions(t, 0, serverConfig, suspended, clientOptions)
 	defer func() {
-		client.Close()
+		client.Close(fmt.Errorf("closed manually by test"))
 		server.stop()
 		cancel()
 	}()
@@ -604,7 +612,7 @@ func (s) TestKeepaliveServerEnforcementWithDormantKeepaliveOnClient(t *testing.T
 	}
 	server, client, cancel := setUpWithOptions(t, 0, serverConfig, normal, clientOptions)
 	defer func() {
-		client.Close()
+		client.Close(fmt.Errorf("closed manually by test"))
 		server.stop()
 		cancel()
 	}()
@@ -658,7 +666,7 @@ func (s) TestTCPUserTimeout(t *testing.T) {
 			},
 		)
 		defer func() {
-			client.Close()
+			client.Close(fmt.Errorf("closed manually by test"))
 			server.stop()
 			cancel()
 		}()

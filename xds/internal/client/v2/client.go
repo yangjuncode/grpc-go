@@ -27,6 +27,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/internal/grpclog"
+	"google.golang.org/grpc/internal/pretty"
 	xdsclient "google.golang.org/grpc/xds/internal/client"
 	"google.golang.org/grpc/xds/internal/version"
 
@@ -125,7 +126,7 @@ func (v2c *client) SendRequest(s grpc.ClientStream, resourceNames []string, rTyp
 	if err := stream.Send(req); err != nil {
 		return fmt.Errorf("xds: stream.Send(%+v) failed: %v", req, err)
 	}
-	v2c.logger.Debugf("ADS request sent: %v", req)
+	v2c.logger.Debugf("ADS request sent: %v", pretty.ToJSON(req))
 	return nil
 }
 
@@ -143,7 +144,7 @@ func (v2c *client) RecvResponse(s grpc.ClientStream) (proto.Message, error) {
 		return nil, fmt.Errorf("xds: stream.Recv() failed: %v", err)
 	}
 	v2c.logger.Infof("ADS response received, type: %v", resp.GetTypeUrl())
-	v2c.logger.Debugf("ADS response received: %v", resp)
+	v2c.logger.Debugf("ADS response received: %v", pretty.ToJSON(resp))
 	return resp, nil
 }
 
@@ -185,43 +186,31 @@ func (v2c *client) HandleResponse(r proto.Message) (xdsclient.ResourceType, stri
 // server. On receipt of a good response, it also invokes the registered watcher
 // callback.
 func (v2c *client) handleLDSResponse(resp *v2xdspb.DiscoveryResponse) error {
-	update, err := xdsclient.UnmarshalListener(resp.GetResources(), v2c.logger)
-	if err != nil {
-		return err
-	}
-	v2c.parent.NewListeners(update)
-	return nil
+	update, md, err := xdsclient.UnmarshalListener(resp.GetVersionInfo(), resp.GetResources(), v2c.logger)
+	v2c.parent.NewListeners(update, md)
+	return err
 }
 
 // handleRDSResponse processes an RDS response received from the management
 // server. On receipt of a good response, it caches validated resources and also
 // invokes the registered watcher callback.
 func (v2c *client) handleRDSResponse(resp *v2xdspb.DiscoveryResponse) error {
-	update, err := xdsclient.UnmarshalRouteConfig(resp.GetResources(), v2c.logger)
-	if err != nil {
-		return err
-	}
-	v2c.parent.NewRouteConfigs(update)
-	return nil
+	update, md, err := xdsclient.UnmarshalRouteConfig(resp.GetVersionInfo(), resp.GetResources(), v2c.logger)
+	v2c.parent.NewRouteConfigs(update, md)
+	return err
 }
 
 // handleCDSResponse processes an CDS response received from the management
 // server. On receipt of a good response, it also invokes the registered watcher
 // callback.
 func (v2c *client) handleCDSResponse(resp *v2xdspb.DiscoveryResponse) error {
-	update, err := xdsclient.UnmarshalCluster(resp.GetResources(), v2c.logger)
-	if err != nil {
-		return err
-	}
-	v2c.parent.NewClusters(update)
-	return nil
+	update, md, err := xdsclient.UnmarshalCluster(resp.GetVersionInfo(), resp.GetResources(), v2c.logger)
+	v2c.parent.NewClusters(update, md)
+	return err
 }
 
 func (v2c *client) handleEDSResponse(resp *v2xdspb.DiscoveryResponse) error {
-	update, err := xdsclient.UnmarshalEndpoints(resp.GetResources(), v2c.logger)
-	if err != nil {
-		return err
-	}
-	v2c.parent.NewEndpoints(update)
-	return nil
+	update, md, err := xdsclient.UnmarshalEndpoints(resp.GetVersionInfo(), resp.GetResources(), v2c.logger)
+	v2c.parent.NewEndpoints(update, md)
+	return err
 }

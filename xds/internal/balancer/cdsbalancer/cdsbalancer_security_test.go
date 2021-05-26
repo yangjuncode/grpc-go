@@ -1,3 +1,5 @@
+// +build go1.12
+
 /*
  * Copyright 2020 gRPC authors.
  *
@@ -20,16 +22,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	"google.golang.org/grpc/attributes"
 	"google.golang.org/grpc/balancer"
 	"google.golang.org/grpc/credentials/local"
 	"google.golang.org/grpc/credentials/tls/certprovider"
 	"google.golang.org/grpc/credentials/xds"
 	"google.golang.org/grpc/internal"
-	xdsinternal "google.golang.org/grpc/internal/credentials/xds"
+	xdscredsinternal "google.golang.org/grpc/internal/credentials/xds"
 	"google.golang.org/grpc/internal/testutils"
+	"google.golang.org/grpc/internal/xds/matcher"
 	"google.golang.org/grpc/resolver"
 	xdsclient "google.golang.org/grpc/xds/internal/client"
 	"google.golang.org/grpc/xds/internal/client/bootstrap"
@@ -41,25 +46,38 @@ const (
 	fakeProvider1Name = "fake-certificate-provider-1"
 	fakeProvider2Name = "fake-certificate-provider-2"
 	fakeConfig        = "my fake config"
+	testSAN           = "test-san"
 )
 
 var (
+	testSANMatchers = []matcher.StringMatcher{
+		matcher.StringMatcherForTesting(newStringP(testSAN), nil, nil, nil, nil, true),
+		matcher.StringMatcherForTesting(nil, newStringP(testSAN), nil, nil, nil, false),
+		matcher.StringMatcherForTesting(nil, nil, newStringP(testSAN), nil, nil, false),
+		matcher.StringMatcherForTesting(nil, nil, nil, nil, regexp.MustCompile(testSAN), false),
+		matcher.StringMatcherForTesting(nil, nil, nil, newStringP(testSAN), nil, false),
+	}
 	fpb1, fpb2                   *fakeProviderBuilder
 	bootstrapConfig              *bootstrap.Config
 	cdsUpdateWithGoodSecurityCfg = xdsclient.ClusterUpdate{
-		ServiceName: serviceName,
+		ClusterName: serviceName,
 		SecurityCfg: &xdsclient.SecurityConfig{
-			RootInstanceName:     "default1",
-			IdentityInstanceName: "default2",
+			RootInstanceName:       "default1",
+			IdentityInstanceName:   "default2",
+			SubjectAltNameMatchers: testSANMatchers,
 		},
 	}
 	cdsUpdateWithMissingSecurityCfg = xdsclient.ClusterUpdate{
-		ServiceName: serviceName,
+		ClusterName: serviceName,
 		SecurityCfg: &xdsclient.SecurityConfig{
 			RootInstanceName: "not-default",
 		},
 	}
 )
+
+func newStringP(s string) *string {
+	return &s
+}
 
 func init() {
 	fpb1 = &fakeProviderBuilder{name: fakeProvider1Name}
@@ -171,34 +189,40 @@ func setupWithXDSCreds(t *testing.T) (*fakeclient.Client, *cdsBalancer, *testEDS
 // makeNewSubConn invokes the NewSubConn() call on the balancer.ClientConn
 // passed to the EDS balancer, and verifies that the CDS balancer forwards the
 // call appropriately to its parent balancer.ClientConn with or without
-// attributes bases on the value of wantAttributes.
-func makeNewSubConn(ctx context.Context, edsCC balancer.ClientConn, parentCC *xdstestutils.TestClientConn, wantFallback bool) error {
+// attributes bases on the value of wantFallback.
+func makeNewSubConn(ctx context.Context, edsCC balancer.ClientConn, parentCC *xdstestutils.TestClientConn, wantFallback bool) (balancer.SubConn, error) {
 	dummyAddr := "foo-address"
 	addrs := []resolver.Address{{Addr: dummyAddr}}
-	if _, err := edsCC.NewSubConn(addrs, balancer.NewSubConnOptions{}); err != nil {
-		return fmt.Errorf("NewSubConn(%+v) on parent ClientConn failed: %v", addrs, err)
+	sc, err := edsCC.NewSubConn(addrs, balancer.NewSubConnOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("NewSubConn(%+v) on parent ClientConn failed: %v", addrs, err)
 	}
 
 	select {
 	case <-ctx.Done():
-		return errors.New("timeout when waiting for new SubConn")
+		return nil, errors.New("timeout when waiting for new SubConn")
 	case gotAddrs := <-parentCC.NewSubConnAddrsCh:
 		if len(gotAddrs) != 1 {
-			return fmt.Errorf("NewSubConn expected 1 address, got %d", len(gotAddrs))
+			return nil, fmt.Errorf("NewSubConn expected 1 address, got %d", len(gotAddrs))
 		}
 		if got, want := gotAddrs[0].Addr, addrs[0].Addr; got != want {
-			return fmt.Errorf("resolver.Address passed to parent ClientConn has address %q, want %q", got, want)
+			return nil, fmt.Errorf("resolver.Address passed to parent ClientConn has address %q, want %q", got, want)
 		}
-		getHI := internal.GetXDSHandshakeInfoForTesting.(func(attr *attributes.Attributes) *xdsinternal.HandshakeInfo)
+		getHI := internal.GetXDSHandshakeInfoForTesting.(func(attr *attributes.Attributes) *xdscredsinternal.HandshakeInfo)
 		hi := getHI(gotAddrs[0].Attributes)
 		if hi == nil {
-			return errors.New("resolver.Address passed to parent ClientConn doesn't contain attributes")
+			return nil, errors.New("resolver.Address passed to parent ClientConn doesn't contain attributes")
 		}
 		if gotFallback := hi.UseFallbackCreds(); gotFallback != wantFallback {
-			return fmt.Errorf("resolver.Address HandshakeInfo uses fallback creds? %v, want %v", gotFallback, wantFallback)
+			return nil, fmt.Errorf("resolver.Address HandshakeInfo uses fallback creds? %v, want %v", gotFallback, wantFallback)
+		}
+		if !wantFallback {
+			if diff := cmp.Diff(testSANMatchers, hi.GetSANMatchersForTesting(), cmp.AllowUnexported(regexp.Regexp{})); diff != "" {
+				return nil, fmt.Errorf("unexpected diff in the list of SAN matchers (-got, +want):\n%s", diff)
+			}
 		}
 	}
-	return nil
+	return sc, nil
 }
 
 // TestSecurityConfigWithoutXDSCreds tests the case where xdsCredentials are not
@@ -232,7 +256,7 @@ func (s) TestSecurityConfigWithoutXDSCreds(t *testing.T) {
 	// create a new EDS balancer. The fake EDS balancer created above will be
 	// returned to the CDS balancer, because we have overridden the
 	// newEDSBalancer function as part of test setup.
-	cdsUpdate := xdsclient.ClusterUpdate{ServiceName: serviceName}
+	cdsUpdate := xdsclient.ClusterUpdate{ClusterName: serviceName}
 	wantCCS := edsCCS(serviceName, nil, false)
 	ctx, ctxCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer ctxCancel()
@@ -243,7 +267,7 @@ func (s) TestSecurityConfigWithoutXDSCreds(t *testing.T) {
 	// Make a NewSubConn and verify that the HandshakeInfo does not contain any
 	// certificate providers, forcing the credentials implementation to use
 	// fallback creds.
-	if err := makeNewSubConn(ctx, edsB.parentCC, tcc, true); err != nil {
+	if _, err := makeNewSubConn(ctx, edsB.parentCC, tcc, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -288,7 +312,7 @@ func (s) TestNoSecurityConfigWithXDSCreds(t *testing.T) {
 	// returned to the CDS balancer, because we have overridden the
 	// newEDSBalancer function as part of test setup. No security config is
 	// passed to the CDS balancer as part of this update.
-	cdsUpdate := xdsclient.ClusterUpdate{ServiceName: serviceName}
+	cdsUpdate := xdsclient.ClusterUpdate{ClusterName: serviceName}
 	wantCCS := edsCCS(serviceName, nil, false)
 	ctx, ctxCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer ctxCancel()
@@ -299,7 +323,7 @@ func (s) TestNoSecurityConfigWithXDSCreds(t *testing.T) {
 	// Make a NewSubConn and verify that the HandshakeInfo does not contain any
 	// certificate providers, forcing the credentials implementation to use
 	// fallback creds.
-	if err := makeNewSubConn(ctx, edsB.parentCC, tcc, true); err != nil {
+	if _, err := makeNewSubConn(ctx, edsB.parentCC, tcc, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -451,7 +475,7 @@ func (s) TestSecurityConfigUpdate_BadToGood(t *testing.T) {
 	}
 
 	// Make a NewSubConn and verify that attributes are added.
-	if err := makeNewSubConn(ctx, edsB.parentCC, tcc, false); err != nil {
+	if _, err := makeNewSubConn(ctx, edsB.parentCC, tcc, false); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -487,8 +511,30 @@ func (s) TestGoodSecurityConfig(t *testing.T) {
 	}
 
 	// Make a NewSubConn and verify that attributes are added.
-	if err := makeNewSubConn(ctx, edsB.parentCC, tcc, false); err != nil {
+	sc, err := makeNewSubConn(ctx, edsB.parentCC, tcc, false)
+	if err != nil {
 		t.Fatal(err)
+	}
+
+	// Invoke UpdateAddresses and verify that attributes are added.
+	dummyAddr := "bar-address"
+	addrs := []resolver.Address{{Addr: dummyAddr}}
+	edsB.parentCC.UpdateAddresses(sc, addrs)
+	select {
+	case <-ctx.Done():
+		t.Fatal("timeout when waiting for addresses to be updated on the subConn")
+	case gotAddrs := <-tcc.UpdateAddressesAddrsCh:
+		if len(gotAddrs) != 1 {
+			t.Fatalf("UpdateAddresses expected 1 address, got %d", len(gotAddrs))
+		}
+		if got, want := gotAddrs[0].Addr, addrs[0].Addr; got != want {
+			t.Fatalf("resolver.Address passed to parent ClientConn through UpdateAddresses() has address %q, want %q", got, want)
+		}
+		getHI := internal.GetXDSHandshakeInfoForTesting.(func(attr *attributes.Attributes) *xdscredsinternal.HandshakeInfo)
+		hi := getHI(gotAddrs[0].Attributes)
+		if hi == nil {
+			t.Fatal("resolver.Address passed to parent ClientConn through UpdateAddresses() doesn't contain attributes")
+		}
 	}
 }
 
@@ -518,7 +564,7 @@ func (s) TestSecurityConfigUpdate_GoodToFallback(t *testing.T) {
 	}
 
 	// Make a NewSubConn and verify that attributes are added.
-	if err := makeNewSubConn(ctx, edsB.parentCC, tcc, false); err != nil {
+	if _, err := makeNewSubConn(ctx, edsB.parentCC, tcc, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -526,13 +572,13 @@ func (s) TestSecurityConfigUpdate_GoodToFallback(t *testing.T) {
 	// an update which contains bad security config. So, we expect the CDS
 	// balancer to forward this error to the EDS balancer and eventually the
 	// channel needs to be put in a bad state.
-	cdsUpdate := xdsclient.ClusterUpdate{ServiceName: serviceName}
+	cdsUpdate := xdsclient.ClusterUpdate{ClusterName: serviceName}
 	if err := invokeWatchCbAndWait(ctx, xdsC, cdsWatchInfo{cdsUpdate, nil}, wantCCS, edsB); err != nil {
 		t.Fatal(err)
 	}
 
 	// Make a NewSubConn and verify that fallback creds are used.
-	if err := makeNewSubConn(ctx, edsB.parentCC, tcc, true); err != nil {
+	if _, err := makeNewSubConn(ctx, edsB.parentCC, tcc, true); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -568,7 +614,7 @@ func (s) TestSecurityConfigUpdate_GoodToBad(t *testing.T) {
 	}
 
 	// Make a NewSubConn and verify that attributes are added.
-	if err := makeNewSubConn(ctx, edsB.parentCC, tcc, false); err != nil {
+	if _, err := makeNewSubConn(ctx, edsB.parentCC, tcc, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -594,7 +640,7 @@ func (s) TestSecurityConfigUpdate_GoodToBad(t *testing.T) {
 	// registered watch should not be cancelled.
 	sCtx, sCancel := context.WithTimeout(context.Background(), defaultTestShortTimeout)
 	defer sCancel()
-	if err := xdsC.WaitForCancelClusterWatch(sCtx); err != context.DeadlineExceeded {
+	if _, err := xdsC.WaitForCancelClusterWatch(sCtx); err != context.DeadlineExceeded {
 		t.Fatal("cluster watch cancelled for a non-resource-not-found-error")
 	}
 }
@@ -632,9 +678,10 @@ func (s) TestSecurityConfigUpdate_GoodToGood(t *testing.T) {
 	// returned to the CDS balancer, because we have overridden the
 	// newEDSBalancer function as part of test setup.
 	cdsUpdate := xdsclient.ClusterUpdate{
-		ServiceName: serviceName,
+		ClusterName: serviceName,
 		SecurityCfg: &xdsclient.SecurityConfig{
-			RootInstanceName: "default1",
+			RootInstanceName:       "default1",
+			SubjectAltNameMatchers: testSANMatchers,
 		},
 	}
 	wantCCS := edsCCS(serviceName, nil, false)
@@ -650,15 +697,16 @@ func (s) TestSecurityConfigUpdate_GoodToGood(t *testing.T) {
 	}
 
 	// Make a NewSubConn and verify that attributes are added.
-	if err := makeNewSubConn(ctx, edsB.parentCC, tcc, false); err != nil {
+	if _, err := makeNewSubConn(ctx, edsB.parentCC, tcc, false); err != nil {
 		t.Fatal(err)
 	}
 
 	// Push another update with a new security configuration.
 	cdsUpdate = xdsclient.ClusterUpdate{
-		ServiceName: serviceName,
+		ClusterName: serviceName,
 		SecurityCfg: &xdsclient.SecurityConfig{
-			RootInstanceName: "default2",
+			RootInstanceName:       "default2",
+			SubjectAltNameMatchers: testSANMatchers,
 		},
 	}
 	if err := invokeWatchCbAndWait(ctx, xdsC, cdsWatchInfo{cdsUpdate, nil}, wantCCS, edsB); err != nil {
@@ -671,7 +719,7 @@ func (s) TestSecurityConfigUpdate_GoodToGood(t *testing.T) {
 	}
 
 	// Make a NewSubConn and verify that attributes are added.
-	if err := makeNewSubConn(ctx, edsB.parentCC, tcc, false); err != nil {
+	if _, err := makeNewSubConn(ctx, edsB.parentCC, tcc, false); err != nil {
 		t.Fatal(err)
 	}
 

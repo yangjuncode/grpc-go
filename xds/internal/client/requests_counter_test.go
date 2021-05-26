@@ -1,3 +1,5 @@
+// +build go1.12
+
 /*
  *
  * Copyright 2020 gRPC authors.
@@ -91,7 +93,11 @@ func testCounter(t *testing.T, test counterTest) {
 	if test.expectedErrors == 0 && loadedError != nil {
 		t.Errorf("error starting request: %v", loadedError.(error))
 	}
-	if successes != test.expectedSuccesses || errors != test.expectedErrors {
+	// We allow the limits to be exceeded during races.
+	//
+	// But we should never over-limit, so this test fails if there are less
+	// successes than expected.
+	if successes < test.expectedSuccesses || errors > test.expectedErrors {
 		t.Errorf("unexpected number of (successes, errors), expected (%v, %v), encountered (%v, %v)", test.expectedSuccesses, test.expectedErrors, successes, errors)
 	}
 }

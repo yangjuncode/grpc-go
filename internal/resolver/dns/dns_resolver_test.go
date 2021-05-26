@@ -30,9 +30,11 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/balancer"
 	grpclbstate "google.golang.org/grpc/balancer/grpclb/state"
 	"google.golang.org/grpc/internal/envconfig"
 	"google.golang.org/grpc/internal/leakcheck"
+	"google.golang.org/grpc/internal/testutils"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/serviceconfig"
 )
@@ -41,13 +43,15 @@ func TestMain(m *testing.M) {
 	// Set a non-zero duration only for tests which are actually testing that
 	// feature.
 	replaceDNSResRate(time.Duration(0)) // No nead to clean up since we os.Exit
-	replaceNetFunc(nil)                 // No nead to clean up since we os.Exit
+	overrideDefaultResolver(false)      // No nead to clean up since we os.Exit
 	code := m.Run()
 	os.Exit(code)
 }
 
 const (
-	txtBytesLimit = 255
+	txtBytesLimit           = 255
+	defaultTestTimeout      = 10 * time.Second
+	defaultTestShortTimeout = 10 * time.Millisecond
 )
 
 type testClientConn struct {
@@ -57,13 +61,17 @@ type testClientConn struct {
 	state               resolver.State
 	updateStateCalls    int
 	errChan             chan error
+	updateStateErr      error
 }
 
-func (t *testClientConn) UpdateState(s resolver.State) {
+func (t *testClientConn) UpdateState(s resolver.State) error {
 	t.m1.Lock()
 	defer t.m1.Unlock()
 	t.state = s
 	t.updateStateCalls++
+	// This error determines whether DNS Resolver actually decides to exponentially backoff or not.
+	// This can be any error.
+	return t.updateStateErr
 }
 
 func (t *testClientConn) getState() (resolver.State, int) {
@@ -99,12 +107,12 @@ type testResolver struct {
 	// A write to this channel is made when this resolver receives a resolution
 	// request. Tests can rely on reading from this channel to be notified about
 	// resolution requests instead of sleeping for a predefined period of time.
-	ch chan struct{}
+	lookupHostCh *testutils.Channel
 }
 
 func (tr *testResolver) LookupHost(ctx context.Context, host string) ([]string, error) {
-	if tr.ch != nil {
-		tr.ch <- struct{}{}
+	if tr.lookupHostCh != nil {
+		tr.lookupHostCh.Send(nil)
 	}
 	return hostLookup(host)
 }
@@ -117,9 +125,17 @@ func (*testResolver) LookupTXT(ctx context.Context, host string) ([]string, erro
 	return txtLookup(host)
 }
 
-func replaceNetFunc(ch chan struct{}) func() {
+// overrideDefaultResolver overrides the defaultResolver used by the code with
+// an instance of the testResolver. pushOnLookup controls whether the
+// testResolver created here pushes lookupHost events on its channel.
+func overrideDefaultResolver(pushOnLookup bool) func() {
 	oldResolver := defaultResolver
-	defaultResolver = &testResolver{ch: ch}
+
+	var lookupHostCh *testutils.Channel
+	if pushOnLookup {
+		lookupHostCh = testutils.NewChannel()
+	}
+	defaultResolver = &testResolver{lookupHostCh: lookupHostCh}
 
 	return func() {
 		defaultResolver = oldResolver
@@ -669,6 +685,13 @@ func TestResolve(t *testing.T) {
 
 func testDNSResolver(t *testing.T) {
 	defer leakcheck.Check(t)
+	defer func(nt func(d time.Duration) *time.Timer) {
+		newTimer = nt
+	}(newTimer)
+	newTimer = func(_ time.Duration) *time.Timer {
+		// Will never fire on its own, will protect from triggering exponential backoff.
+		return time.NewTimer(time.Hour)
+	}
 	tests := []struct {
 		target   string
 		addrWant []resolver.Address
@@ -736,12 +759,151 @@ func testDNSResolver(t *testing.T) {
 	}
 }
 
+// DNS Resolver immediately starts polling on an error from grpc. This should continue until the ClientConn doesn't
+// send back an error from updating the DNS Resolver's state.
+func TestDNSResolverExponentialBackoff(t *testing.T) {
+	defer leakcheck.Check(t)
+	defer func(nt func(d time.Duration) *time.Timer) {
+		newTimer = nt
+	}(newTimer)
+	timerChan := testutils.NewChannel()
+	newTimer = func(d time.Duration) *time.Timer {
+		// Will never fire on its own, allows this test to call timer immediately.
+		t := time.NewTimer(time.Hour)
+		timerChan.Send(t)
+		return t
+	}
+	tests := []struct {
+		name     string
+		target   string
+		addrWant []resolver.Address
+		scWant   string
+	}{
+		{
+			"happy case default port",
+			"foo.bar.com",
+			[]resolver.Address{{Addr: "1.2.3.4" + colonDefaultPort}, {Addr: "5.6.7.8" + colonDefaultPort}},
+			generateSC("foo.bar.com"),
+		},
+		{
+			"happy case specified port",
+			"foo.bar.com:1234",
+			[]resolver.Address{{Addr: "1.2.3.4:1234"}, {Addr: "5.6.7.8:1234"}},
+			generateSC("foo.bar.com"),
+		},
+		{
+			"happy case another default port",
+			"srv.ipv4.single.fake",
+			[]resolver.Address{{Addr: "2.4.6.8" + colonDefaultPort}},
+			generateSC("srv.ipv4.single.fake"),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			b := NewBuilder()
+			cc := &testClientConn{target: test.target}
+			// Cause ClientConn to return an error.
+			cc.updateStateErr = balancer.ErrBadResolverState
+			r, err := b.Build(resolver.Target{Endpoint: test.target}, cc, resolver.BuildOptions{})
+			if err != nil {
+				t.Fatalf("Error building resolver for target %v: %v", test.target, err)
+			}
+			var state resolver.State
+			var cnt int
+			for i := 0; i < 2000; i++ {
+				state, cnt = cc.getState()
+				if cnt > 0 {
+					break
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if cnt == 0 {
+				t.Fatalf("UpdateState not called after 2s; aborting")
+			}
+			if !reflect.DeepEqual(test.addrWant, state.Addresses) {
+				t.Errorf("Resolved addresses of target: %q = %+v, want %+v", test.target, state.Addresses, test.addrWant)
+			}
+			sc := scFromState(state)
+			if test.scWant != sc {
+				t.Errorf("Resolved service config of target: %q = %+v, want %+v", test.target, sc, test.scWant)
+			}
+			ctx, ctxCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+			defer ctxCancel()
+			// Cause timer to go off 10 times, and see if it calls updateState() correctly.
+			for i := 0; i < 10; i++ {
+				timer, err := timerChan.Receive(ctx)
+				if err != nil {
+					t.Fatalf("Error receiving timer from mock NewTimer call: %v", err)
+				}
+				timerPointer := timer.(*time.Timer)
+				timerPointer.Reset(0)
+			}
+			// Poll to see if DNS Resolver updated state the correct number of times, which allows time for the DNS Resolver to call
+			// ClientConn update state.
+			deadline := time.Now().Add(defaultTestTimeout)
+			for {
+				cc.m1.Lock()
+				got := cc.updateStateCalls
+				cc.m1.Unlock()
+				if got == 11 {
+					break
+				}
+
+				if time.Now().After(deadline) {
+					t.Fatalf("Exponential backoff is not working as expected - should update state 11 times instead of %d", got)
+				}
+
+				time.Sleep(time.Millisecond)
+			}
+
+			// Update resolver.ClientConn to not return an error anymore - this should stop it from backing off.
+			cc.updateStateErr = nil
+			timer, err := timerChan.Receive(ctx)
+			if err != nil {
+				t.Fatalf("Error receiving timer from mock NewTimer call: %v", err)
+			}
+			timerPointer := timer.(*time.Timer)
+			timerPointer.Reset(0)
+			// Poll to see if DNS Resolver updated state the correct number of times, which allows time for the DNS Resolver to call
+			// ClientConn update state the final time. The DNS Resolver should then stop polling.
+			deadline = time.Now().Add(defaultTestTimeout)
+			for {
+				cc.m1.Lock()
+				got := cc.updateStateCalls
+				cc.m1.Unlock()
+				if got == 12 {
+					break
+				}
+
+				if time.Now().After(deadline) {
+					t.Fatalf("Exponential backoff is not working as expected - should stop backing off at 12 total UpdateState calls instead of %d", got)
+				}
+
+				_, err := timerChan.ReceiveOrFail()
+				if err {
+					t.Fatalf("Should not poll again after Client Conn stops returning error.")
+				}
+
+				time.Sleep(time.Millisecond)
+			}
+			r.Close()
+		})
+	}
+}
+
 func testDNSResolverWithSRV(t *testing.T) {
 	EnableSRVLookups = true
 	defer func() {
 		EnableSRVLookups = false
 	}()
 	defer leakcheck.Check(t)
+	defer func(nt func(d time.Duration) *time.Timer) {
+		newTimer = nt
+	}(newTimer)
+	newTimer = func(_ time.Duration) *time.Timer {
+		// Will never fire on its own, will protect from triggering exponential backoff.
+		return time.NewTimer(time.Hour)
+	}
 	tests := []struct {
 		target      string
 		addrWant    []resolver.Address
@@ -855,6 +1017,13 @@ func mutateTbl(target string) func() {
 
 func testDNSResolveNow(t *testing.T) {
 	defer leakcheck.Check(t)
+	defer func(nt func(d time.Duration) *time.Timer) {
+		newTimer = nt
+	}(newTimer)
+	newTimer = func(_ time.Duration) *time.Timer {
+		// Will never fire on its own, will protect from triggering exponential backoff.
+		return time.NewTimer(time.Hour)
+	}
 	tests := []struct {
 		target   string
 		addrWant []resolver.Address
@@ -926,6 +1095,13 @@ const colonDefaultPort = ":" + defaultPort
 
 func testIPResolver(t *testing.T) {
 	defer leakcheck.Check(t)
+	defer func(nt func(d time.Duration) *time.Timer) {
+		newTimer = nt
+	}(newTimer)
+	newTimer = func(_ time.Duration) *time.Timer {
+		// Will never fire on its own, will protect from triggering exponential backoff.
+		return time.NewTimer(time.Hour)
+	}
 	tests := []struct {
 		target string
 		want   []resolver.Address
@@ -975,6 +1151,13 @@ func testIPResolver(t *testing.T) {
 
 func TestResolveFunc(t *testing.T) {
 	defer leakcheck.Check(t)
+	defer func(nt func(d time.Duration) *time.Timer) {
+		newTimer = nt
+	}(newTimer)
+	newTimer = func(d time.Duration) *time.Timer {
+		// Will never fire on its own, will protect from triggering exponential backoff.
+		return time.NewTimer(time.Hour)
+	}
 	tests := []struct {
 		addr string
 		want error
@@ -1013,6 +1196,13 @@ func TestResolveFunc(t *testing.T) {
 
 func TestDisableServiceConfig(t *testing.T) {
 	defer leakcheck.Check(t)
+	defer func(nt func(d time.Duration) *time.Timer) {
+		newTimer = nt
+	}(newTimer)
+	newTimer = func(d time.Duration) *time.Timer {
+		// Will never fire on its own, will protect from triggering exponential backoff.
+		return time.NewTimer(time.Hour)
+	}
 	tests := []struct {
 		target               string
 		scWant               string
@@ -1059,6 +1249,13 @@ func TestDisableServiceConfig(t *testing.T) {
 
 func TestTXTError(t *testing.T) {
 	defer leakcheck.Check(t)
+	defer func(nt func(d time.Duration) *time.Timer) {
+		newTimer = nt
+	}(newTimer)
+	newTimer = func(d time.Duration) *time.Timer {
+		// Will never fire on its own, will protect from triggering exponential backoff.
+		return time.NewTimer(time.Hour)
+	}
 	defer func(v bool) { envconfig.TXTErrIgnore = v }(envconfig.TXTErrIgnore)
 	for _, ignore := range []bool{false, true} {
 		envconfig.TXTErrIgnore = ignore
@@ -1090,6 +1287,13 @@ func TestTXTError(t *testing.T) {
 }
 
 func TestDNSResolverRetry(t *testing.T) {
+	defer func(nt func(d time.Duration) *time.Timer) {
+		newTimer = nt
+	}(newTimer)
+	newTimer = func(d time.Duration) *time.Timer {
+		// Will never fire on its own, will protect from triggering exponential backoff.
+		return time.NewTimer(time.Hour)
+	}
 	b := NewBuilder()
 	target := "ipv4.single.fake"
 	cc := &testClientConn{target: target}
@@ -1144,6 +1348,13 @@ func TestDNSResolverRetry(t *testing.T) {
 
 func TestCustomAuthority(t *testing.T) {
 	defer leakcheck.Check(t)
+	defer func(nt func(d time.Duration) *time.Timer) {
+		newTimer = nt
+	}(newTimer)
+	newTimer = func(d time.Duration) *time.Timer {
+		// Will never fire on its own, will protect from triggering exponential backoff.
+		return time.NewTimer(time.Hour)
+	}
 
 	tests := []struct {
 		authority     string
@@ -1249,16 +1460,33 @@ func TestCustomAuthority(t *testing.T) {
 // requests. It sets the re-resolution rate to a small value and repeatedly
 // calls ResolveNow() and ensures only the expected number of resolution
 // requests are made.
+
 func TestRateLimitedResolve(t *testing.T) {
 	defer leakcheck.Check(t)
+	defer func(nt func(d time.Duration) *time.Timer) {
+		newTimer = nt
+	}(newTimer)
+	newTimer = func(d time.Duration) *time.Timer {
+		// Will never fire on its own, will protect from triggering exponential
+		// backoff.
+		return time.NewTimer(time.Hour)
+	}
+	defer func(nt func(d time.Duration) *time.Timer) {
+		newTimerDNSResRate = nt
+	}(newTimerDNSResRate)
 
-	const dnsResRate = 10 * time.Millisecond
-	dc := replaceDNSResRate(dnsResRate)
-	defer dc()
+	timerChan := testutils.NewChannel()
+	newTimerDNSResRate = func(d time.Duration) *time.Timer {
+		// Will never fire on its own, allows this test to call timer
+		// immediately.
+		t := time.NewTimer(time.Hour)
+		timerChan.Send(t)
+		return t
+	}
 
 	// Create a new testResolver{} for this test because we want the exact count
 	// of the number of times the resolver was invoked.
-	nc := replaceNetFunc(make(chan struct{}))
+	nc := overrideDefaultResolver(true)
 	defer nc()
 
 	target := "foo.bar.com"
@@ -1281,55 +1509,65 @@ func TestRateLimitedResolve(t *testing.T) {
 		t.Fatalf("delegate resolver returned unexpected type: %T\n", tr)
 	}
 
-	// Observe the time before unblocking the lookupHost call.  The 100ms rate
-	// limiting timer will begin immediately after that.  This means the next
-	// resolution could happen less than 100ms if we read the time *after*
-	// receiving from tr.ch
-	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
 
 	// Wait for the first resolution request to be done. This happens as part
-	// of the first iteration of the for loop in watcher() because we call
-	// ResolveNow in Build.
-	<-tr.ch
-
-	// Here we start a couple of goroutines. One repeatedly calls ResolveNow()
-	// until asked to stop, and the other waits for two resolution requests to be
-	// made to our testResolver and stops the former. We measure the start and
-	// end times, and expect the duration elapsed to be in the interval
-	// {wantCalls*dnsResRate, wantCalls*dnsResRate}
-	done := make(chan struct{})
-	go func() {
-		for {
-			select {
-			case <-done:
-				return
-			default:
-				r.ResolveNow(resolver.ResolveNowOptions{})
-				time.Sleep(1 * time.Millisecond)
-			}
-		}
-	}()
-
-	gotCalls := 0
-	const wantCalls = 3
-	min, max := wantCalls*dnsResRate, (wantCalls+1)*dnsResRate
-	tMax := time.NewTimer(max)
-	for gotCalls != wantCalls {
-		select {
-		case <-tr.ch:
-			gotCalls++
-		case <-tMax.C:
-			t.Fatalf("Timed out waiting for %v calls after %v; got %v", wantCalls, max, gotCalls)
-		}
+	// of the first iteration of the for loop in watcher().
+	if _, err := tr.lookupHostCh.Receive(ctx); err != nil {
+		t.Fatalf("Timed out waiting for lookup() call.")
 	}
-	close(done)
-	elapsed := time.Since(start)
 
-	if gotCalls != wantCalls {
-		t.Fatalf("resolve count mismatch for target: %q = %+v, want %+v\n", target, gotCalls, wantCalls)
+	// Call Resolve Now 100 times, shouldn't continue onto next iteration of
+	// watcher, thus shouldn't lookup again.
+	for i := 0; i <= 100; i++ {
+		r.ResolveNow(resolver.ResolveNowOptions{})
 	}
-	if elapsed < min {
-		t.Fatalf("elapsed time: %v, wanted it to be between {%v and %v}", elapsed, min, max)
+
+	continueCtx, continueCancel := context.WithTimeout(context.Background(), defaultTestShortTimeout)
+	defer continueCancel()
+
+	if _, err := tr.lookupHostCh.Receive(continueCtx); err == nil {
+		t.Fatalf("Should not have looked up again as DNS Min Res Rate timer has not gone off.")
+	}
+
+	// Make the DNSMinResRate timer fire immediately (by receiving it, then
+	// resetting to 0), this will unblock the resolver which is currently
+	// blocked on the DNS Min Res Rate timer going off, which will allow it to
+	// continue to the next iteration of the watcher loop.
+	timer, err := timerChan.Receive(ctx)
+	if err != nil {
+		t.Fatalf("Error receiving timer from mock NewTimer call: %v", err)
+	}
+	timerPointer := timer.(*time.Timer)
+	timerPointer.Reset(0)
+
+	// Now that DNS Min Res Rate timer has gone off, it should lookup again.
+	if _, err := tr.lookupHostCh.Receive(ctx); err != nil {
+		t.Fatalf("Timed out waiting for lookup() call.")
+	}
+
+	// Resolve Now 1000 more times, shouldn't lookup again as DNS Min Res Rate
+	// timer has not gone off.
+	for i := 0; i < 1000; i++ {
+		r.ResolveNow(resolver.ResolveNowOptions{})
+	}
+
+	if _, err = tr.lookupHostCh.Receive(continueCtx); err == nil {
+		t.Fatalf("Should not have looked up again as DNS Min Res Rate timer has not gone off.")
+	}
+
+	// Make the DNSMinResRate timer fire immediately again.
+	timer, err = timerChan.Receive(ctx)
+	if err != nil {
+		t.Fatalf("Error receiving timer from mock NewTimer call: %v", err)
+	}
+	timerPointer = timer.(*time.Timer)
+	timerPointer.Reset(0)
+
+	// Now that DNS Min Res Rate timer has gone off, it should lookup again.
+	if _, err = tr.lookupHostCh.Receive(ctx); err != nil {
+		t.Fatalf("Timed out waiting for lookup() call.")
 	}
 
 	wantAddrs := []resolver.Address{{Addr: "1.2.3.4" + colonDefaultPort}, {Addr: "5.6.7.8" + colonDefaultPort}}
@@ -1347,21 +1585,66 @@ func TestRateLimitedResolve(t *testing.T) {
 	}
 }
 
+// DNS Resolver immediately starts polling on an error. This will cause the re-resolution to return another error.
+// Thus, test that it constantly sends errors to the grpc.ClientConn.
 func TestReportError(t *testing.T) {
 	const target = "notfoundaddress"
+	defer func(nt func(d time.Duration) *time.Timer) {
+		newTimer = nt
+	}(newTimer)
+	timerChan := testutils.NewChannel()
+	newTimer = func(d time.Duration) *time.Timer {
+		// Will never fire on its own, allows this test to call timer immediately.
+		t := time.NewTimer(time.Hour)
+		timerChan.Send(t)
+		return t
+	}
 	cc := &testClientConn{target: target, errChan: make(chan error)}
+	totalTimesCalledError := 0
 	b := NewBuilder()
 	r, err := b.Build(resolver.Target{Endpoint: target}, cc, resolver.BuildOptions{})
 	if err != nil {
-		t.Fatalf("%v\n", err)
+		t.Fatalf("Error building resolver for target %v: %v", target, err)
 	}
+	// Should receive first error.
+	err = <-cc.errChan
+	if !strings.Contains(err.Error(), "hostLookup error") {
+		t.Fatalf(`ReportError(err=%v) called; want err contains "hostLookupError"`, err)
+	}
+	totalTimesCalledError++
+	ctx, ctxCancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer ctxCancel()
+	timer, err := timerChan.Receive(ctx)
+	if err != nil {
+		t.Fatalf("Error receiving timer from mock NewTimer call: %v", err)
+	}
+	timerPointer := timer.(*time.Timer)
+	timerPointer.Reset(0)
 	defer r.Close()
-	select {
-	case err := <-cc.errChan:
+
+	// Cause timer to go off 10 times, and see if it matches DNS Resolver updating Error.
+	for i := 0; i < 10; i++ {
+		// Should call ReportError().
+		err = <-cc.errChan
 		if !strings.Contains(err.Error(), "hostLookup error") {
 			t.Fatalf(`ReportError(err=%v) called; want err contains "hostLookupError"`, err)
 		}
-	case <-time.After(time.Second):
-		t.Fatalf("did not receive error after 1s")
+		totalTimesCalledError++
+		timer, err := timerChan.Receive(ctx)
+		if err != nil {
+			t.Fatalf("Error receiving timer from mock NewTimer call: %v", err)
+		}
+		timerPointer := timer.(*time.Timer)
+		timerPointer.Reset(0)
+	}
+
+	if totalTimesCalledError != 11 {
+		t.Errorf("ReportError() not called 11 times, instead called %d times.", totalTimesCalledError)
+	}
+	// Clean up final watcher iteration.
+	<-cc.errChan
+	_, err = timerChan.Receive(ctx)
+	if err != nil {
+		t.Fatalf("Error receiving timer from mock NewTimer call: %v", err)
 	}
 }

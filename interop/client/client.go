@@ -20,7 +20,10 @@
 package main
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"flag"
+	"io/ioutil"
 	"net"
 	"strconv"
 
@@ -34,6 +37,7 @@ import (
 	"google.golang.org/grpc/interop"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/testdata"
+	_ "google.golang.org/grpc/xds/googledirectpath"
 
 	testgrpc "google.golang.org/grpc/interop/grpc_testing"
 )
@@ -55,7 +59,8 @@ var (
 	defaultServiceAccount = flag.String("default_service_account", "", "Email of GCE default service account")
 	serverHost            = flag.String("server_host", "localhost", "The server host name")
 	serverPort            = flag.Int("server_port", 10000, "The server port number")
-	tlsServerName         = flag.String("server_host_override", "", "The server name use to verify the hostname returned by TLS handshake if it is not empty. Otherwise, --server_host is used.")
+	serviceConfigJSON     = flag.String("service_config_json", "", "Disables service config lookups and sets the provided string as the default service config.")
+	tlsServerName         = flag.String("server_host_override", "", "The server name used to verify the hostname returned by TLS handshake if it is not empty. Otherwise, --server_host is used.")
 	testCase              = flag.String("test_case", "large_unary",
 		`Configure different test cases. Valid options are:
         empty_unary : empty (zero bytes) request and response;
@@ -126,26 +131,32 @@ func main() {
 	}
 
 	resolver.SetDefaultScheme("dns")
-	serverAddr := net.JoinHostPort(*serverHost, strconv.Itoa(*serverPort))
+	serverAddr := *serverHost
+	if *serverPort != 0 {
+		serverAddr = net.JoinHostPort(*serverHost, strconv.Itoa(*serverPort))
+	}
 	var opts []grpc.DialOption
 	switch credsChosen {
 	case credsTLS:
-		var sn string
-		if *tlsServerName != "" {
-			sn = *tlsServerName
-		}
-		var creds credentials.TransportCredentials
+		var roots *x509.CertPool
 		if *testCA {
-			var err error
 			if *caFile == "" {
 				*caFile = testdata.Path("ca.pem")
 			}
-			creds, err = credentials.NewClientTLSFromFile(*caFile, sn)
+			b, err := ioutil.ReadFile(*caFile)
 			if err != nil {
-				logger.Fatalf("Failed to create TLS credentials %v", err)
+				logger.Fatalf("Failed to read root certificate file %q: %v", *caFile, err)
 			}
+			roots = x509.NewCertPool()
+			if !roots.AppendCertsFromPEM(b) {
+				logger.Fatalf("Failed to append certificates: %s", string(b))
+			}
+		}
+		var creds credentials.TransportCredentials
+		if *tlsServerName != "" {
+			creds = credentials.NewClientTLSFromCert(roots, *tlsServerName)
 		} else {
-			creds = credentials.NewClientTLSFromCert(nil, sn)
+			creds = credentials.NewTLS(&tls.Config{RootCAs: roots})
 		}
 		opts = append(opts, grpc.WithTransportCredentials(creds))
 	case credsALTS:
@@ -182,6 +193,9 @@ func main() {
 		} else if *testCase == "oauth2_auth_token" {
 			opts = append(opts, grpc.WithPerRPCCredentials(oauth.NewOauthAccess(interop.GetToken(*serviceAccountKeyFile, *oauthScope))))
 		}
+	}
+	if len(*serviceConfigJSON) > 0 {
+		opts = append(opts, grpc.WithDisableServiceConfig(), grpc.WithDefaultServiceConfig(*serviceConfigJSON))
 	}
 	opts = append(opts, grpc.WithBlock())
 	conn, err := grpc.Dial(serverAddr, opts...)

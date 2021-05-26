@@ -31,6 +31,7 @@ import (
 	xdsinternal "google.golang.org/grpc/internal/credentials/xds"
 	"google.golang.org/grpc/internal/grpclog"
 	"google.golang.org/grpc/internal/grpcsync"
+	"google.golang.org/grpc/internal/pretty"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/serviceconfig"
 	"google.golang.org/grpc/xds/internal/balancer/edsbalancer"
@@ -78,6 +79,7 @@ func (cdsBB) Build(cc balancer.ClientConn, opts balancer.BuildOptions) balancer.
 		bOpts:       opts,
 		updateCh:    buffer.NewUnbounded(),
 		closed:      grpcsync.NewEvent(),
+		done:        grpcsync.NewEvent(),
 		cancelWatch: func() {}, // No-op at this point.
 		xdsHI:       xdsinternal.NewHandshakeInfo(nil, nil),
 	}
@@ -150,6 +152,11 @@ type ccUpdate struct {
 	err         error
 }
 
+type clusterHandlerUpdate struct {
+	chu []xdsclient.ClusterUpdate
+	err error
+}
+
 // scUpdate wraps a subConn update received from gRPC. This is directly passed
 // on to the edsBalancer.
 type scUpdate struct {
@@ -181,6 +188,7 @@ type cdsBalancer struct {
 	clusterToWatch string
 	logger         *grpclog.PrefixLogger
 	closed         *grpcsync.Event
+	done           *grpcsync.Event
 
 	// The certificate providers are cached here to that they can be closed when
 	// a new provider is to be created.
@@ -235,7 +243,7 @@ func (b *cdsBalancer) handleSecurityConfig(config *xdsclient.SecurityConfig) err
 		// one where fallback credentials are to be used.
 		b.xdsHI.SetRootCertProvider(nil)
 		b.xdsHI.SetIdentityCertProvider(nil)
-		b.xdsHI.SetAcceptedSANs(nil)
+		b.xdsHI.SetSANMatchers(nil)
 		return nil
 	}
 
@@ -278,7 +286,7 @@ func (b *cdsBalancer) handleSecurityConfig(config *xdsclient.SecurityConfig) err
 	// could have been non-nil earlier.
 	b.xdsHI.SetRootCertProvider(rootProvider)
 	b.xdsHI.SetIdentityCertProvider(identityProvider)
-	b.xdsHI.SetAcceptedSANs(config.AcceptedSANs)
+	b.xdsHI.SetSANMatchers(config.SubjectAltNameMatchers)
 	return nil
 }
 
@@ -311,7 +319,7 @@ func (b *cdsBalancer) handleWatchUpdate(update *watchUpdate) {
 		return
 	}
 
-	b.logger.Infof("Watch update from xds-client %p, content: %+v", b.xdsClient, update.cds)
+	b.logger.Infof("Watch update from xds-client %p, content: %+v", b.xdsClient, pretty.ToJSON(update.cds))
 
 	// Process the security config from the received update before building the
 	// child policy or forwarding the update to it. We do this because the child
@@ -340,7 +348,8 @@ func (b *cdsBalancer) handleWatchUpdate(update *watchUpdate) {
 		b.logger.Infof("Created child policy %p of type %s", b.edsLB, edsName)
 	}
 	lbCfg := &edsbalancer.EDSConfig{
-		EDSServiceName:        update.cds.ServiceName,
+		ClusterName:           update.cds.ClusterName,
+		EDSServiceName:        update.cds.EDSServiceName,
 		MaxConcurrentRequests: update.cds.MaxRequests,
 	}
 	if update.cds.EnableLRS {
@@ -380,9 +389,6 @@ func (b *cdsBalancer) run() {
 			case *watchUpdate:
 				b.handleWatchUpdate(update)
 			}
-
-		// Close results in cancellation of the CDS watch and closing of the
-		// underlying edsBalancer and is the only way to exit this goroutine.
 		case <-b.closed.Done():
 			b.cancelWatch()
 			b.cancelWatch = func() {}
@@ -391,8 +397,15 @@ func (b *cdsBalancer) run() {
 				b.edsLB.Close()
 				b.edsLB = nil
 			}
-			// This is the *ONLY* point of return from this function.
+			b.xdsClient.Close()
+			if b.cachedRoot != nil {
+				b.cachedRoot.Close()
+			}
+			if b.cachedIdentity != nil {
+				b.cachedIdentity.Close()
+			}
 			b.logger.Infof("Shutdown")
+			b.done.Fire()
 			return
 		}
 	}
@@ -455,7 +468,7 @@ func (b *cdsBalancer) UpdateClientConnState(state balancer.ClientConnState) erro
 		return errBalancerClosed
 	}
 
-	b.logger.Infof("Received update from resolver, balancer config: %+v", state.BalancerConfig)
+	b.logger.Infof("Received update from resolver, balancer config: %+v", pretty.ToJSON(state.BalancerConfig))
 	// The errors checked here should ideally never happen because the
 	// ServiceConfig in this case is prepared by the xdsResolver and is not
 	// something that is received on the wire.
@@ -490,16 +503,19 @@ func (b *cdsBalancer) UpdateSubConnState(sc balancer.SubConn, state balancer.Sub
 	b.updateCh.Put(&scUpdate{subConn: sc, state: state})
 }
 
-// Close closes the cdsBalancer and the underlying edsBalancer.
+// Close cancels the CDS watch, closes the child policy and closes the
+// cdsBalancer.
 func (b *cdsBalancer) Close() {
 	b.closed.Fire()
-	b.xdsClient.Close()
+	<-b.done.Done()
 }
 
-// ccWrapper wraps the balancer.ClientConn that was passed in to the CDS
-// balancer during creation and intercepts the NewSubConn() call from the child
-// policy. Other methods of the balancer.ClientConn interface are not overridden
-// and hence get the original implementation.
+// ccWrapper wraps the balancer.ClientConn passed to the CDS balancer at
+// creation and intercepts the NewSubConn() and UpdateAddresses() call from the
+// child policy to add security configuration required by xDS credentials.
+//
+// Other methods of the balancer.ClientConn interface are not overridden and
+// hence get the original implementation.
 type ccWrapper struct {
 	balancer.ClientConn
 
@@ -517,4 +533,12 @@ func (ccw *ccWrapper) NewSubConn(addrs []resolver.Address, opts balancer.NewSubC
 		newAddrs[i] = xdsinternal.SetHandshakeInfo(addr, ccw.xdsHI)
 	}
 	return ccw.ClientConn.NewSubConn(newAddrs, opts)
+}
+
+func (ccw *ccWrapper) UpdateAddresses(sc balancer.SubConn, addrs []resolver.Address) {
+	newAddrs := make([]resolver.Address, len(addrs))
+	for i, addr := range addrs {
+		newAddrs[i] = xdsinternal.SetHandshakeInfo(addr, ccw.xdsHI)
+	}
+	ccw.ClientConn.UpdateAddresses(sc, newAddrs)
 }

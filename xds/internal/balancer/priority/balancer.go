@@ -24,6 +24,7 @@
 package priority
 
 import (
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -33,11 +34,14 @@ import (
 	"google.golang.org/grpc/internal/grpclog"
 	"google.golang.org/grpc/internal/grpcsync"
 	"google.golang.org/grpc/internal/hierarchy"
+	"google.golang.org/grpc/internal/pretty"
 	"google.golang.org/grpc/resolver"
+	"google.golang.org/grpc/serviceconfig"
 	"google.golang.org/grpc/xds/internal/balancer/balancergroup"
 )
 
-const priorityBalancerName = "priority_experimental"
+// Name is the name of the priority balancer.
+const Name = "priority_experimental"
 
 func init() {
 	balancer.Register(priorityBB{})
@@ -60,11 +64,14 @@ func (priorityBB) Build(cc balancer.ClientConn, bOpts balancer.BuildOptions) bal
 	go b.run()
 	b.logger.Infof("Created")
 	return b
+}
 
+func (b priorityBB) ParseConfig(s json.RawMessage) (serviceconfig.LoadBalancingConfig, error) {
+	return parseConfig(s)
 }
 
 func (priorityBB) Name() string {
-	return priorityBalancerName
+	return Name
 }
 
 // timerWrapper wraps a timer with a boolean. So that when a race happens
@@ -102,7 +109,8 @@ type priorityBalancer struct {
 }
 
 func (b *priorityBalancer) UpdateClientConnState(s balancer.ClientConnState) error {
-	newConfig, ok := s.BalancerConfig.(*lbConfig)
+	b.logger.Infof("Received update from resolver, balancer config: %+v", pretty.ToJSON(s.BalancerConfig))
+	newConfig, ok := s.BalancerConfig.(*LBConfig)
 	if !ok {
 		return fmt.Errorf("unexpected balancer config with type: %T", s.BalancerConfig)
 	}
@@ -125,7 +133,7 @@ func (b *priorityBalancer) UpdateClientConnState(s balancer.ClientConnState) err
 			// the balancer isn't built, because this child can be a low
 			// priority. If necessary, it will be built when syncing priorities.
 			cb := newChildBalancer(name, b, bb)
-			cb.updateConfig(newSubConfig.Config.Config, resolver.State{
+			cb.updateConfig(newSubConfig, resolver.State{
 				Addresses:     addressesSplit[name],
 				ServiceConfig: s.ResolverState.ServiceConfig,
 				Attributes:    s.ResolverState.Attributes,
@@ -140,13 +148,13 @@ func (b *priorityBalancer) UpdateClientConnState(s balancer.ClientConnState) err
 		// rebuild, rebuild will happen when syncing priorities.
 		if currentChild.bb.Name() != bb.Name() {
 			currentChild.stop()
-			currentChild.bb = bb
+			currentChild.updateBuilder(bb)
 		}
 
 		// Update config and address, but note that this doesn't send the
 		// updates to child balancer (the child balancer might not be built, if
 		// it's a low priority).
-		currentChild.updateConfig(newSubConfig.Config.Config, resolver.State{
+		currentChild.updateConfig(newSubConfig, resolver.State{
 			Addresses:     addressesSplit[name],
 			ServiceConfig: s.ResolverState.ServiceConfig,
 			Attributes:    s.ResolverState.Attributes,

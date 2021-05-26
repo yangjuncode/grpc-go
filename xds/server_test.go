@@ -1,3 +1,5 @@
+// +build go1.12
+
 /*
  *
  * Copyright 2020 gRPC authors.
@@ -24,9 +26,13 @@ import (
 	"fmt"
 	"net"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
+	v3corepb "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	v3listenerpb "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	v3tlspb "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/credentials/tls/certprovider"
@@ -40,9 +46,9 @@ import (
 )
 
 const (
-	defaultTestTimeout       = 5 * time.Second
-	defaultTestShortTimeout  = 10 * time.Millisecond
-	testServerResourceNameID = "/path/to/resource"
+	defaultTestTimeout                     = 5 * time.Second
+	defaultTestShortTimeout                = 10 * time.Millisecond
+	testServerListenerResourceNameTemplate = "/path/to/resource/%s/%s"
 )
 
 type s struct {
@@ -88,6 +94,14 @@ func newFakeGRPCServer() *fakeGRPCServer {
 		stopCh:            testutils.NewChannel(),
 		gracefulStopCh:    testutils.NewChannel(),
 	}
+}
+
+func splitHostPort(hostport string) (string, string) {
+	addr, port, err := net.SplitHostPort(hostport)
+	if err != nil {
+		panic(fmt.Sprintf("listener address %q does not parse: %v", hostport, err))
+	}
+	return addr, port
 }
 
 func (s) TestNewServer(t *testing.T) {
@@ -173,8 +187,14 @@ var (
 )
 
 func init() {
-	fpb1 = &fakeProviderBuilder{name: fakeProvider1Name}
-	fpb2 = &fakeProviderBuilder{name: fakeProvider2Name}
+	fpb1 = &fakeProviderBuilder{
+		name:    fakeProvider1Name,
+		buildCh: testutils.NewChannel(),
+	}
+	fpb2 = &fakeProviderBuilder{
+		name:    fakeProvider2Name,
+		buildCh: testutils.NewChannel(),
+	}
 	cfg1, _ := fpb1.ParseConfig(fakeConfig + "1111")
 	cfg2, _ := fpb2.ParseConfig(fakeConfig + "2222")
 	certProviderConfigs = map[string]*certprovider.BuildableConfig{
@@ -188,7 +208,8 @@ func init() {
 // fakeProviderBuilder builds new instances of fakeProvider and interprets the
 // config provided to it as a string.
 type fakeProviderBuilder struct {
-	name string
+	name    string
+	buildCh *testutils.Channel
 }
 
 func (b *fakeProviderBuilder) ParseConfig(config interface{}) (*certprovider.BuildableConfig, error) {
@@ -197,6 +218,7 @@ func (b *fakeProviderBuilder) ParseConfig(config interface{}) (*certprovider.Bui
 		return nil, fmt.Errorf("providerBuilder %s received config of type %T, want string", b.name, config)
 	}
 	return certprovider.NewBuildableConfig(b.name, []byte(s), func(certprovider.BuildOptions) certprovider.Provider {
+		b.buildCh.Send(nil)
 		return &fakeProvider{
 			Distributor: certprovider.NewDistributor(),
 			config:      s,
@@ -220,19 +242,19 @@ func (p *fakeProvider) Close() {
 	p.Distributor.Stop()
 }
 
-// setupOverrides sets up overrides for bootstrap config, new xdsClient creation,
-// new gRPC.Server creation, and certificate provider creation.
-func setupOverrides() (*fakeGRPCServer, *testutils.Channel, *testutils.Channel, func()) {
+// setupOverrides sets up overrides for bootstrap config, new xdsClient creation
+// and new gRPC.Server creation.
+func setupOverrides() (*fakeGRPCServer, *testutils.Channel, func()) {
 	clientCh := testutils.NewChannel()
 	origNewXDSClient := newXDSClient
 	newXDSClient = func() (xdsClientInterface, error) {
 		c := fakeclient.NewClient()
 		c.SetBootstrapConfig(&bootstrap.Config{
-			BalancerName:         "dummyBalancer",
-			Creds:                grpc.WithTransportCredentials(insecure.NewCredentials()),
-			NodeProto:            xdstestutils.EmptyNodeProtoV3,
-			ServerResourceNameID: testServerResourceNameID,
-			CertProviderConfigs:  certProviderConfigs,
+			BalancerName:                       "dummyBalancer",
+			Creds:                              grpc.WithTransportCredentials(insecure.NewCredentials()),
+			NodeProto:                          xdstestutils.EmptyNodeProtoV3,
+			ServerListenerResourceNameTemplate: testServerListenerResourceNameTemplate,
+			CertProviderConfigs:                certProviderConfigs,
 		})
 		clientCh.Send(c)
 		return c, nil
@@ -242,18 +264,9 @@ func setupOverrides() (*fakeGRPCServer, *testutils.Channel, *testutils.Channel, 
 	origNewGRPCServer := newGRPCServer
 	newGRPCServer = func(opts ...grpc.ServerOption) grpcServerInterface { return fs }
 
-	providerCh := testutils.NewChannel()
-	origBuildProvider := buildProvider
-	buildProvider = func(c map[string]*certprovider.BuildableConfig, id, cert string, wi, wr bool) (certprovider.Provider, error) {
-		p, err := origBuildProvider(c, id, cert, wi, wr)
-		providerCh.Send(nil)
-		return p, err
-	}
-
-	return fs, clientCh, providerCh, func() {
+	return fs, clientCh, func() {
 		newXDSClient = origNewXDSClient
 		newGRPCServer = origNewGRPCServer
-		buildProvider = origBuildProvider
 	}
 }
 
@@ -261,16 +274,16 @@ func setupOverrides() (*fakeGRPCServer, *testutils.Channel, *testutils.Channel, 
 // one. Tests that use xdsCredentials need a real grpc.Server instead of a fake
 // one, because the xDS-enabled server needs to read configured creds from the
 // underlying grpc.Server to confirm whether xdsCreds were configured.
-func setupOverridesForXDSCreds(includeCertProviderCfg bool) (*testutils.Channel, *testutils.Channel, func()) {
+func setupOverridesForXDSCreds(includeCertProviderCfg bool) (*testutils.Channel, func()) {
 	clientCh := testutils.NewChannel()
 	origNewXDSClient := newXDSClient
 	newXDSClient = func() (xdsClientInterface, error) {
 		c := fakeclient.NewClient()
 		bc := &bootstrap.Config{
-			BalancerName:         "dummyBalancer",
-			Creds:                grpc.WithTransportCredentials(insecure.NewCredentials()),
-			NodeProto:            xdstestutils.EmptyNodeProtoV3,
-			ServerResourceNameID: testServerResourceNameID,
+			BalancerName:                       "dummyBalancer",
+			Creds:                              grpc.WithTransportCredentials(insecure.NewCredentials()),
+			NodeProto:                          xdstestutils.EmptyNodeProtoV3,
+			ServerListenerResourceNameTemplate: testServerListenerResourceNameTemplate,
 		}
 		if includeCertProviderCfg {
 			bc.CertProviderConfigs = certProviderConfigs
@@ -280,18 +293,7 @@ func setupOverridesForXDSCreds(includeCertProviderCfg bool) (*testutils.Channel,
 		return c, nil
 	}
 
-	providerCh := testutils.NewChannel()
-	origBuildProvider := buildProvider
-	buildProvider = func(c map[string]*certprovider.BuildableConfig, id, cert string, wi, wr bool) (certprovider.Provider, error) {
-		p, err := origBuildProvider(c, id, cert, wi, wr)
-		providerCh.Send(nil)
-		return p, err
-	}
-
-	return clientCh, providerCh, func() {
-		newXDSClient = origNewXDSClient
-		buildProvider = origBuildProvider
-	}
+	return clientCh, func() { newXDSClient = origNewXDSClient }
 }
 
 // TestServeSuccess tests the successful case of calling Serve().
@@ -303,10 +305,17 @@ func setupOverridesForXDSCreds(includeCertProviderCfg bool) (*testutils.Channel,
 // 4. Push a good response from the xdsClient, and make sure that Serve() on the
 // 	  underlying grpc.Server is called.
 func (s) TestServeSuccess(t *testing.T) {
-	fs, clientCh, _, cleanup := setupOverrides()
+	fs, clientCh, cleanup := setupOverrides()
 	defer cleanup()
 
-	server := NewGRPCServer()
+	// Create a new xDS-enabled gRPC server and pass it a server option to get
+	// notified about serving mode changes.
+	modeChangeCh := testutils.NewChannel()
+	modeChangeOption := ServingModeCallback(func(addr net.Addr, args ServingModeChangeArgs) {
+		t.Logf("server mode change callback invoked for listener %q with mode %q and error %v", addr.String(), args.Mode, args.Err)
+		modeChangeCh.Send(args.Mode)
+	})
+	server := NewGRPCServer(modeChangeOption)
 	defer server.Stop()
 
 	lis, err := xdstestutils.LocalTCPListener()
@@ -337,25 +346,75 @@ func (s) TestServeSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("error when waiting for a ListenerWatch: %v", err)
 	}
-	wantName := fmt.Sprintf("%s?udpa.resource.listening_address=%s", client.BootstrapConfig().ServerResourceNameID, lis.Addr().String())
+	wantName := strings.Replace(testServerListenerResourceNameTemplate, "%s", lis.Addr().String(), -1)
 	if name != wantName {
 		t.Fatalf("LDS watch registered for name %q, want %q", name, wantName)
 	}
 
 	// Push an error to the registered listener watch callback and make sure
 	// that Serve does not return.
-	client.InvokeWatchListenerCallback(xdsclient.ListenerUpdate{}, errors.New("LDS error"))
+	client.InvokeWatchListenerCallback(xdsclient.ListenerUpdate{}, xdsclient.NewErrorf(xdsclient.ErrorTypeResourceNotFound, "LDS resource not found"))
 	sCtx, sCancel := context.WithTimeout(context.Background(), defaultTestShortTimeout)
 	defer sCancel()
 	if _, err := serveDone.Receive(sCtx); err != context.DeadlineExceeded {
 		t.Fatal("Serve() returned after a bad LDS response")
 	}
 
+	// Make sure the serving mode changes appropriately.
+	v, err := modeChangeCh.Receive(ctx)
+	if err != nil {
+		t.Fatalf("error when waiting for serving mode to change: %v", err)
+	}
+	if mode := v.(ServingMode); mode != ServingModeNotServing {
+		t.Fatalf("server mode is %q, want %q", mode, ServingModeNotServing)
+	}
+
 	// Push a good LDS response, and wait for Serve() to be invoked on the
 	// underlying grpc.Server.
-	client.InvokeWatchListenerCallback(xdsclient.ListenerUpdate{RouteConfigName: "routeconfig"}, nil)
+	addr, port := splitHostPort(lis.Addr().String())
+	client.InvokeWatchListenerCallback(xdsclient.ListenerUpdate{
+		RouteConfigName: "routeconfig",
+		InboundListenerCfg: &xdsclient.InboundListenerConfig{
+			Address: addr,
+			Port:    port,
+		},
+	}, nil)
 	if _, err := fs.serveCh.Receive(ctx); err != nil {
 		t.Fatalf("error when waiting for Serve() to be invoked on the grpc.Server")
+	}
+
+	// Make sure the serving mode changes appropriately.
+	v, err = modeChangeCh.Receive(ctx)
+	if err != nil {
+		t.Fatalf("error when waiting for serving mode to change: %v", err)
+	}
+	if mode := v.(ServingMode); mode != ServingModeServing {
+		t.Fatalf("server mode is %q, want %q", mode, ServingModeServing)
+	}
+
+	// Push an update to the registered listener watch callback with a Listener
+	// resource whose host:port does not match the actual listening address and
+	// port. This will push the listener to "not-serving" mode.
+	client.InvokeWatchListenerCallback(xdsclient.ListenerUpdate{
+		RouteConfigName: "routeconfig",
+		InboundListenerCfg: &xdsclient.InboundListenerConfig{
+			Address: "10.20.30.40",
+			Port:    "666",
+		},
+	}, nil)
+	sCtx, sCancel = context.WithTimeout(context.Background(), defaultTestShortTimeout)
+	defer sCancel()
+	if _, err := serveDone.Receive(sCtx); err != context.DeadlineExceeded {
+		t.Fatal("Serve() returned after a bad LDS response")
+	}
+
+	// Make sure the serving mode changes appropriately.
+	v, err = modeChangeCh.Receive(ctx)
+	if err != nil {
+		t.Fatalf("error when waiting for serving mode to change: %v", err)
+	}
+	if mode := v.(ServingMode); mode != ServingModeNotServing {
+		t.Fatalf("server mode is %q, want %q", mode, ServingModeNotServing)
 	}
 }
 
@@ -363,7 +422,7 @@ func (s) TestServeSuccess(t *testing.T) {
 // is received. This should cause Serve() to exit before calling Serve() on the
 // underlying grpc.Server.
 func (s) TestServeWithStop(t *testing.T) {
-	fs, clientCh, _, cleanup := setupOverrides()
+	fs, clientCh, cleanup := setupOverrides()
 	defer cleanup()
 
 	// Note that we are not deferring the Stop() here since we explicitly call
@@ -399,7 +458,7 @@ func (s) TestServeWithStop(t *testing.T) {
 		server.Stop()
 		t.Fatalf("error when waiting for a ListenerWatch: %v", err)
 	}
-	wantName := fmt.Sprintf("%s?udpa.resource.listening_address=%s", client.BootstrapConfig().ServerResourceNameID, lis.Addr().String())
+	wantName := strings.Replace(testServerListenerResourceNameTemplate, "%s", lis.Addr().String(), -1)
 	if name != wantName {
 		server.Stop()
 		t.Fatalf("LDS watch registered for name %q, wantPrefix %q", name, wantName)
@@ -448,39 +507,79 @@ func (s) TestServeBootstrapFailure(t *testing.T) {
 	}
 }
 
-// TestServeBootstrapWithMissingCertProviders tests the case where the bootstrap
-// config does not contain certificate provider configuration, but xdsCreds are
-// passed to the server. Verifies that the call to Serve() fails.
-func (s) TestServeBootstrapWithMissingCertProviders(t *testing.T) {
-	_, _, cleanup := setupOverridesForXDSCreds(false)
-	defer cleanup()
-
-	xdsCreds, err := xds.NewServerCredentials(xds.ServerOptions{FallbackCreds: insecure.NewCredentials()})
-	if err != nil {
-		t.Fatalf("failed to create xds server credentials: %v", err)
+// TestServeBootstrapConfigInvalid tests the cases where the bootstrap config
+// does not contain expected fields. Verifies that the call to Serve() fails.
+func (s) TestServeBootstrapConfigInvalid(t *testing.T) {
+	tests := []struct {
+		desc            string
+		bootstrapConfig *bootstrap.Config
+	}{
+		{
+			desc:            "bootstrap config is missing",
+			bootstrapConfig: nil,
+		},
+		{
+			desc: "certificate provider config is missing",
+			bootstrapConfig: &bootstrap.Config{
+				BalancerName:                       "dummyBalancer",
+				Creds:                              grpc.WithTransportCredentials(insecure.NewCredentials()),
+				NodeProto:                          xdstestutils.EmptyNodeProtoV3,
+				ServerListenerResourceNameTemplate: testServerListenerResourceNameTemplate,
+			},
+		},
+		{
+			desc: "server_listener_resource_name_template is missing",
+			bootstrapConfig: &bootstrap.Config{
+				BalancerName:        "dummyBalancer",
+				Creds:               grpc.WithTransportCredentials(insecure.NewCredentials()),
+				NodeProto:           xdstestutils.EmptyNodeProtoV3,
+				CertProviderConfigs: certProviderConfigs,
+			},
+		},
 	}
-	server := NewGRPCServer(grpc.Creds(xdsCreds))
-	defer server.Stop()
 
-	lis, err := xdstestutils.LocalTCPListener()
-	if err != nil {
-		t.Fatalf("xdstestutils.LocalTCPListener() failed: %v", err)
-	}
+	for _, test := range tests {
+		t.Run(test.desc, func(t *testing.T) {
+			// Override the xdsClient creation with one that returns a fake
+			// xdsClient with the specified bootstrap configuration.
+			clientCh := testutils.NewChannel()
+			origNewXDSClient := newXDSClient
+			newXDSClient = func() (xdsClientInterface, error) {
+				c := fakeclient.NewClient()
+				c.SetBootstrapConfig(test.bootstrapConfig)
+				clientCh.Send(c)
+				return c, nil
+			}
+			defer func() { newXDSClient = origNewXDSClient }()
 
-	serveDone := testutils.NewChannel()
-	go func() {
-		err := server.Serve(lis)
-		serveDone.Send(err)
-	}()
+			xdsCreds, err := xds.NewServerCredentials(xds.ServerOptions{FallbackCreds: insecure.NewCredentials()})
+			if err != nil {
+				t.Fatalf("failed to create xds server credentials: %v", err)
+			}
+			server := NewGRPCServer(grpc.Creds(xdsCreds))
+			defer server.Stop()
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
-	defer cancel()
-	v, err := serveDone.Receive(ctx)
-	if err != nil {
-		t.Fatalf("error when waiting for Serve() to exit: %v", err)
-	}
-	if err, ok := v.(error); !ok || err == nil {
-		t.Fatal("Serve() did not exit with error")
+			lis, err := xdstestutils.LocalTCPListener()
+			if err != nil {
+				t.Fatalf("xdstestutils.LocalTCPListener() failed: %v", err)
+			}
+
+			serveDone := testutils.NewChannel()
+			go func() {
+				err := server.Serve(lis)
+				serveDone.Send(err)
+			}()
+
+			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+			defer cancel()
+			v, err := serveDone.Receive(ctx)
+			if err != nil {
+				t.Fatalf("error when waiting for Serve() to exit: %v", err)
+			}
+			if err, ok := v.(error); !ok || err == nil {
+				t.Fatal("Serve() did not exit with error")
+			}
+		})
 	}
 }
 
@@ -522,7 +621,7 @@ func (s) TestServeNewClientFailure(t *testing.T) {
 // server is not configured with xDS credentials. Verifies that the security
 // config received as part of a Listener update is not acted upon.
 func (s) TestHandleListenerUpdate_NoXDSCreds(t *testing.T) {
-	fs, clientCh, providerCh, cleanup := setupOverrides()
+	fs, clientCh, cleanup := setupOverrides()
 	defer cleanup()
 
 	server := NewGRPCServer()
@@ -556,7 +655,7 @@ func (s) TestHandleListenerUpdate_NoXDSCreds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("error when waiting for a ListenerWatch: %v", err)
 	}
-	wantName := fmt.Sprintf("%s?udpa.resource.listening_address=%s", client.BootstrapConfig().ServerResourceNameID, lis.Addr().String())
+	wantName := strings.Replace(testServerListenerResourceNameTemplate, "%s", lis.Addr().String(), -1)
 	if name != wantName {
 		t.Fatalf("LDS watch registered for name %q, want %q", name, wantName)
 	}
@@ -564,12 +663,35 @@ func (s) TestHandleListenerUpdate_NoXDSCreds(t *testing.T) {
 	// Push a good LDS response with security config, and wait for Serve() to be
 	// invoked on the underlying grpc.Server. Also make sure that certificate
 	// providers are not created.
+	fcm, err := xdsclient.NewFilterChainManager(&v3listenerpb.Listener{
+		FilterChains: []*v3listenerpb.FilterChain{
+			{
+				TransportSocket: &v3corepb.TransportSocket{
+					Name: "envoy.transport_sockets.tls",
+					ConfigType: &v3corepb.TransportSocket_TypedConfig{
+						TypedConfig: testutils.MarshalAny(&v3tlspb.DownstreamTlsContext{
+							CommonTlsContext: &v3tlspb.CommonTlsContext{
+								TlsCertificateCertificateProviderInstance: &v3tlspb.CommonTlsContext_CertificateProviderInstance{
+									InstanceName:    "identityPluginInstance",
+									CertificateName: "identityCertName",
+								},
+							},
+						}),
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("xdsclient.NewFilterChainManager() failed with error: %v", err)
+	}
+	addr, port := splitHostPort(lis.Addr().String())
 	client.InvokeWatchListenerCallback(xdsclient.ListenerUpdate{
 		RouteConfigName: "routeconfig",
-		SecurityCfg: &xdsclient.SecurityConfig{
-			RootInstanceName:     "default1",
-			IdentityInstanceName: "default2",
-			RequireClientCert:    true,
+		InboundListenerCfg: &xdsclient.InboundListenerConfig{
+			Address:      addr,
+			Port:         port,
+			FilterChains: fcm,
 		},
 	}, nil)
 	if _, err := fs.serveCh.Receive(ctx); err != nil {
@@ -577,10 +699,8 @@ func (s) TestHandleListenerUpdate_NoXDSCreds(t *testing.T) {
 	}
 
 	// Make sure the security configuration is not acted upon.
-	sCtx, sCancel := context.WithTimeout(context.Background(), defaultTestShortTimeout)
-	defer sCancel()
-	if _, err := providerCh.Receive(sCtx); err != context.DeadlineExceeded {
-		t.Fatalf("certificate provider created when no xDS creds were specified")
+	if err := verifyCertProviderNotCreated(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -588,7 +708,7 @@ func (s) TestHandleListenerUpdate_NoXDSCreds(t *testing.T) {
 // server is configured with xDS credentials, but receives a Listener update
 // with an error. Verifies that no certificate providers are created.
 func (s) TestHandleListenerUpdate_ErrorUpdate(t *testing.T) {
-	clientCh, providerCh, cleanup := setupOverridesForXDSCreds(true)
+	clientCh, cleanup := setupOverridesForXDSCreds(true)
 	defer cleanup()
 
 	xdsCreds, err := xds.NewServerCredentials(xds.ServerOptions{FallbackCreds: insecure.NewCredentials()})
@@ -627,21 +747,14 @@ func (s) TestHandleListenerUpdate_ErrorUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("error when waiting for a ListenerWatch: %v", err)
 	}
-	wantName := fmt.Sprintf("%s?udpa.resource.listening_address=%s", client.BootstrapConfig().ServerResourceNameID, lis.Addr().String())
+	wantName := strings.Replace(testServerListenerResourceNameTemplate, "%s", lis.Addr().String(), -1)
 	if name != wantName {
 		t.Fatalf("LDS watch registered for name %q, want %q", name, wantName)
 	}
 
 	// Push an error to the registered listener watch callback and make sure
 	// that Serve does not return.
-	client.InvokeWatchListenerCallback(xdsclient.ListenerUpdate{
-		RouteConfigName: "routeconfig",
-		SecurityCfg: &xdsclient.SecurityConfig{
-			RootInstanceName:     "default1",
-			IdentityInstanceName: "default2",
-			RequireClientCert:    true,
-		},
-	}, errors.New("LDS error"))
+	client.InvokeWatchListenerCallback(xdsclient.ListenerUpdate{}, errors.New("LDS error"))
 	sCtx, sCancel := context.WithTimeout(context.Background(), defaultTestShortTimeout)
 	defer sCancel()
 	if _, err := serveDone.Receive(sCtx); err != context.DeadlineExceeded {
@@ -649,84 +762,21 @@ func (s) TestHandleListenerUpdate_ErrorUpdate(t *testing.T) {
 	}
 
 	// Also make sure that no certificate providers are created.
-	sCtx, sCancel = context.WithTimeout(context.Background(), defaultTestShortTimeout)
-	defer sCancel()
-	if _, err := providerCh.Receive(sCtx); err != context.DeadlineExceeded {
-		t.Fatalf("certificate provider created when no xDS creds were specified")
+	if err := verifyCertProviderNotCreated(); err != nil {
+		t.Fatal(err)
 	}
 }
 
-func (s) TestHandleListenerUpdate_ClosedListener(t *testing.T) {
-	clientCh, providerCh, cleanup := setupOverridesForXDSCreds(true)
-	defer cleanup()
-
-	xdsCreds, err := xds.NewServerCredentials(xds.ServerOptions{FallbackCreds: insecure.NewCredentials()})
-	if err != nil {
-		t.Fatalf("failed to create xds server credentials: %v", err)
-	}
-
-	server := NewGRPCServer(grpc.Creds(xdsCreds))
-	defer server.Stop()
-
-	lis, err := xdstestutils.LocalTCPListener()
-	if err != nil {
-		t.Fatalf("xdstestutils.LocalTCPListener() failed: %v", err)
-	}
-
-	// Call Serve() in a goroutine, and push on a channel when Serve returns.
-	serveDone := testutils.NewChannel()
-	go func() { serveDone.Send(server.Serve(lis)) }()
-
-	// Wait for an xdsClient to be created.
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
-	defer cancel()
-	c, err := clientCh.Receive(ctx)
-	if err != nil {
-		t.Fatalf("error when waiting for new xdsClient to be created: %v", err)
-	}
-	client := c.(*fakeclient.Client)
-
-	// Wait for a listener watch to be registered on the xdsClient.
-	name, err := client.WaitForWatchListener(ctx)
-	if err != nil {
-		t.Fatalf("error when waiting for a ListenerWatch: %v", err)
-	}
-	wantName := fmt.Sprintf("%s?udpa.resource.listening_address=%s", client.BootstrapConfig().ServerResourceNameID, lis.Addr().String())
-	if name != wantName {
-		t.Fatalf("LDS watch registered for name %q, want %q", name, wantName)
-	}
-
-	// Push a good update to the registered listener watch callback. This will
-	// unblock the xds-enabled server which is waiting for a good listener
-	// update before calling Serve() on the underlying grpc.Server.
-	client.InvokeWatchListenerCallback(xdsclient.ListenerUpdate{
-		RouteConfigName: "routeconfig",
-		SecurityCfg:     &xdsclient.SecurityConfig{IdentityInstanceName: "default2"},
-	}, nil)
-	if _, err := providerCh.Receive(ctx); err != nil {
-		t.Fatal("error when waiting for certificate provider to be created")
-	}
-
-	// Close the listener passed to Serve(), and wait for the latter to return a
-	// non-nil error.
-	lis.Close()
-	v, err := serveDone.Receive(ctx)
-	if err != nil {
-		t.Fatalf("error when waiting for Serve() to exit: %v", err)
-	}
-	if err, ok := v.(error); !ok || err == nil {
-		t.Fatal("Serve() did not exit with error")
-	}
-
-	// Push another listener update and make sure that no certificate providers
-	// are created.
-	client.InvokeWatchListenerCallback(xdsclient.ListenerUpdate{
-		RouteConfigName: "routeconfig",
-		SecurityCfg:     &xdsclient.SecurityConfig{IdentityInstanceName: "default1"},
-	}, nil)
+func verifyCertProviderNotCreated() error {
 	sCtx, sCancel := context.WithTimeout(context.Background(), defaultTestShortTimeout)
 	defer sCancel()
-	if _, err := providerCh.Receive(sCtx); err != context.DeadlineExceeded {
-		t.Fatalf("certificate provider created when no xDS creds were specified")
+	if _, err := fpb1.buildCh.Receive(sCtx); err != context.DeadlineExceeded {
+		return errors.New("certificate provider created when no xDS creds were specified")
 	}
+	sCtx, sCancel = context.WithTimeout(context.Background(), defaultTestShortTimeout)
+	defer sCancel()
+	if _, err := fpb2.buildCh.Receive(sCtx); err != context.DeadlineExceeded {
+		return errors.New("certificate provider created when no xDS creds were specified")
+	}
+	return nil
 }

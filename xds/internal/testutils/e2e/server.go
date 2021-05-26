@@ -23,9 +23,13 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"reflect"
 	"strconv"
 
+	v3clusterpb "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	v3endpointpb "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	v3listenerpb "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	v3routepb "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	v3discoverygrpc "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	"github.com/envoyproxy/go-control-plane/pkg/cache/types"
 	v3cache "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
@@ -41,10 +45,22 @@ var logger = grpclog.Component("xds-e2e")
 // envoyproxy/go-control-plane/pkg/log. This is passed to the Snapshot cache.
 type serverLogger struct{}
 
-func (l serverLogger) Debugf(format string, args ...interface{}) { logger.Infof(format, args...) }
-func (l serverLogger) Infof(format string, args ...interface{})  { logger.Infof(format, args...) }
-func (l serverLogger) Warnf(format string, args ...interface{})  { logger.Warningf(format, args...) }
-func (l serverLogger) Errorf(format string, args ...interface{}) { logger.Errorf(format, args...) }
+func (l serverLogger) Debugf(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	logger.InfoDepth(1, msg)
+}
+func (l serverLogger) Infof(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	logger.InfoDepth(1, msg)
+}
+func (l serverLogger) Warnf(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	logger.WarningDepth(1, msg)
+}
+func (l serverLogger) Errorf(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	logger.ErrorDepth(1, msg)
+}
 
 // ManagementServer is a thin wrapper around the xDS control plane
 // implementation provided by envoyproxy/go-control-plane.
@@ -103,9 +119,16 @@ func StartManagementServer() (*ManagementServer, error) {
 type UpdateOptions struct {
 	// NodeID is the id of the client to which this update is to be pushed.
 	NodeID string
-	// Listeners is the updated list of listener resources.
+	// Endpoints, Clusters, Routes, and Listeners are the updated list of xds
+	// resources for the server.  All must be provided with each Update.
+	Endpoints []*v3endpointpb.ClusterLoadAssignment
+	Clusters  []*v3clusterpb.Cluster
+	Routes    []*v3routepb.RouteConfiguration
 	Listeners []*v3listenerpb.Listener
-	// TODO(easwars): Add support for other resource types.
+	// SkipValidation indicates whether we want to skip validation (by not
+	// calling snapshot.Consistent()). It can be useful for negative tests,
+	// where we send updates that the client will NACK.
+	SkipValidation bool
 }
 
 // Update changes the resource snapshot held by the management server, which
@@ -114,13 +137,11 @@ func (s *ManagementServer) Update(opts UpdateOptions) error {
 	s.version++
 
 	// Create a snapshot with the passed in resources.
-	var listeners []types.Resource
-	for _, l := range opts.Listeners {
-		listeners = append(listeners, l)
-	}
-	snapshot := v3cache.NewSnapshot(strconv.Itoa(s.version), nil, nil, nil, listeners, nil, nil)
-	if err := snapshot.Consistent(); err != nil {
-		return fmt.Errorf("failed to create new resource snapshot: %v", err)
+	snapshot := v3cache.NewSnapshot(strconv.Itoa(s.version), resourceSlice(opts.Endpoints), resourceSlice(opts.Clusters), resourceSlice(opts.Routes), resourceSlice(opts.Listeners), nil /*runtimes*/, nil /*secrets*/)
+	if !opts.SkipValidation {
+		if err := snapshot.Consistent(); err != nil {
+			return fmt.Errorf("failed to create new resource snapshot: %v", err)
+		}
 	}
 	logger.Infof("Created new resource snapshot...")
 
@@ -138,5 +159,15 @@ func (s *ManagementServer) Stop() {
 		s.cancel()
 	}
 	s.gs.Stop()
-	logger.Infof("Stopped the xDS management server...")
+}
+
+// resourceSlice accepts a slice of any type of proto messages and returns a
+// slice of types.Resource.  Will panic if there is an input type mismatch.
+func resourceSlice(i interface{}) []types.Resource {
+	v := reflect.ValueOf(i)
+	rs := make([]types.Resource, v.Len())
+	for i := 0; i < v.Len(); i++ {
+		rs[i] = v.Index(i).Interface().(types.Resource)
+	}
+	return rs
 }

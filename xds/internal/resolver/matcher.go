@@ -20,12 +20,12 @@ package resolver
 
 import (
 	"fmt"
-	"regexp"
 	"strings"
 
 	"google.golang.org/grpc/internal/grpcrand"
 	"google.golang.org/grpc/internal/grpcutil"
 	iresolver "google.golang.org/grpc/internal/resolver"
+	"google.golang.org/grpc/internal/xds/matcher"
 	"google.golang.org/grpc/metadata"
 	xdsclient "google.golang.org/grpc/xds/internal/client"
 )
@@ -34,11 +34,7 @@ func routeToMatcher(r *xdsclient.Route) (*compositeMatcher, error) {
 	var pathMatcher pathMatcherInterface
 	switch {
 	case r.Regex != nil:
-		re, err := regexp.Compile(*r.Regex)
-		if err != nil {
-			return nil, fmt.Errorf("failed to compile regex %q", *r.Regex)
-		}
-		pathMatcher = newPathRegexMatcher(re)
+		pathMatcher = newPathRegexMatcher(r.Regex)
 	case r.Path != nil:
 		pathMatcher = newPathExactMatcher(*r.Path, r.CaseInsensitive)
 	case r.Prefix != nil:
@@ -47,31 +43,27 @@ func routeToMatcher(r *xdsclient.Route) (*compositeMatcher, error) {
 		return nil, fmt.Errorf("illegal route: missing path_matcher")
 	}
 
-	var headerMatchers []headerMatcherInterface
+	var headerMatchers []matcher.HeaderMatcherInterface
 	for _, h := range r.Headers {
-		var matcherT headerMatcherInterface
+		var matcherT matcher.HeaderMatcherInterface
 		switch {
 		case h.ExactMatch != nil && *h.ExactMatch != "":
-			matcherT = newHeaderExactMatcher(h.Name, *h.ExactMatch)
-		case h.RegexMatch != nil && *h.RegexMatch != "":
-			re, err := regexp.Compile(*h.RegexMatch)
-			if err != nil {
-				return nil, fmt.Errorf("failed to compile regex %q, skipping this matcher", *h.RegexMatch)
-			}
-			matcherT = newHeaderRegexMatcher(h.Name, re)
+			matcherT = matcher.NewHeaderExactMatcher(h.Name, *h.ExactMatch)
+		case h.RegexMatch != nil:
+			matcherT = matcher.NewHeaderRegexMatcher(h.Name, h.RegexMatch)
 		case h.PrefixMatch != nil && *h.PrefixMatch != "":
-			matcherT = newHeaderPrefixMatcher(h.Name, *h.PrefixMatch)
+			matcherT = matcher.NewHeaderPrefixMatcher(h.Name, *h.PrefixMatch)
 		case h.SuffixMatch != nil && *h.SuffixMatch != "":
-			matcherT = newHeaderSuffixMatcher(h.Name, *h.SuffixMatch)
+			matcherT = matcher.NewHeaderSuffixMatcher(h.Name, *h.SuffixMatch)
 		case h.RangeMatch != nil:
-			matcherT = newHeaderRangeMatcher(h.Name, h.RangeMatch.Start, h.RangeMatch.End)
+			matcherT = matcher.NewHeaderRangeMatcher(h.Name, h.RangeMatch.Start, h.RangeMatch.End)
 		case h.PresentMatch != nil:
-			matcherT = newHeaderPresentMatcher(h.Name, *h.PresentMatch)
+			matcherT = matcher.NewHeaderPresentMatcher(h.Name, *h.PresentMatch)
 		default:
 			return nil, fmt.Errorf("illegal route: missing header_match_specifier")
 		}
 		if h.InvertMatch != nil && *h.InvertMatch {
-			matcherT = newInvertMatcher(matcherT)
+			matcherT = matcher.NewInvertMatcher(matcherT)
 		}
 		headerMatchers = append(headerMatchers, matcherT)
 	}
@@ -86,11 +78,11 @@ func routeToMatcher(r *xdsclient.Route) (*compositeMatcher, error) {
 // compositeMatcher.match returns true if all matchers return true.
 type compositeMatcher struct {
 	pm  pathMatcherInterface
-	hms []headerMatcherInterface
+	hms []matcher.HeaderMatcherInterface
 	fm  *fractionMatcher
 }
 
-func newCompositeMatcher(pm pathMatcherInterface, hms []headerMatcherInterface, fm *fractionMatcher) *compositeMatcher {
+func newCompositeMatcher(pm pathMatcherInterface, hms []matcher.HeaderMatcherInterface, fm *fractionMatcher) *compositeMatcher {
 	return &compositeMatcher{pm: pm, hms: hms, fm: fm}
 }
 
@@ -116,7 +108,7 @@ func (a *compositeMatcher) match(info iresolver.RPCInfo) bool {
 		}
 	}
 	for _, m := range a.hms {
-		if !m.match(md) {
+		if !m.Match(md) {
 			return false
 		}
 	}

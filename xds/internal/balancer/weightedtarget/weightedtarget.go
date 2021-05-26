@@ -26,6 +26,7 @@ import (
 	"google.golang.org/grpc/balancer"
 	"google.golang.org/grpc/internal/grpclog"
 	"google.golang.org/grpc/internal/hierarchy"
+	"google.golang.org/grpc/internal/pretty"
 	"google.golang.org/grpc/internal/wrr"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/serviceconfig"
@@ -33,11 +34,12 @@ import (
 	"google.golang.org/grpc/xds/internal/balancer/weightedtarget/weightedaggregator"
 )
 
-const weightedTargetName = "weighted_target_experimental"
+// Name is the name of the weighted_target balancer.
+const Name = "weighted_target_experimental"
 
-// newRandomWRR is the WRR constructor used to pick sub-pickers from
+// NewRandomWRR is the WRR constructor used to pick sub-pickers from
 // sub-balancers. It's to be modified in tests.
-var newRandomWRR = wrr.NewRandom
+var NewRandomWRR = wrr.NewRandom
 
 func init() {
 	balancer.Register(&weightedTargetBB{})
@@ -48,7 +50,7 @@ type weightedTargetBB struct{}
 func (wt *weightedTargetBB) Build(cc balancer.ClientConn, bOpts balancer.BuildOptions) balancer.Balancer {
 	b := &weightedTargetBalancer{}
 	b.logger = prefixLogger(b)
-	b.stateAggregator = weightedaggregator.New(cc, b.logger, newRandomWRR)
+	b.stateAggregator = weightedaggregator.New(cc, b.logger, NewRandomWRR)
 	b.stateAggregator.Start()
 	b.bg = balancergroup.New(cc, bOpts, b.stateAggregator, nil, b.logger)
 	b.bg.Start()
@@ -57,7 +59,7 @@ func (wt *weightedTargetBB) Build(cc balancer.ClientConn, bOpts balancer.BuildOp
 }
 
 func (wt *weightedTargetBB) Name() string {
-	return weightedTargetName
+	return Name
 }
 
 func (wt *weightedTargetBB) ParseConfig(c json.RawMessage) (serviceconfig.LoadBalancingConfig, error) {
@@ -75,14 +77,15 @@ type weightedTargetBalancer struct {
 	bg              *balancergroup.BalancerGroup
 	stateAggregator *weightedaggregator.Aggregator
 
-	targets map[string]target
+	targets map[string]Target
 }
 
 // UpdateClientConnState takes the new targets in balancer group,
 // creates/deletes sub-balancers and sends them update. Addresses are split into
 // groups based on hierarchy path.
 func (w *weightedTargetBalancer) UpdateClientConnState(s balancer.ClientConnState) error {
-	newConfig, ok := s.BalancerConfig.(*lbConfig)
+	w.logger.Infof("Received update from resolver, balancer config: %+v", pretty.ToJSON(s.BalancerConfig))
+	newConfig, ok := s.BalancerConfig.(*LBConfig)
 	if !ok {
 		return fmt.Errorf("unexpected balancer config with type: %T", s.BalancerConfig)
 	}
@@ -115,6 +118,16 @@ func (w *weightedTargetBalancer) UpdateClientConnState(s balancer.ClientConnStat
 			w.bg.Add(name, balancer.Get(newT.ChildPolicy.Name))
 			// Not trigger a state/picker update. Wait for the new sub-balancer
 			// to send its updates.
+		} else if newT.ChildPolicy.Name != oldT.ChildPolicy.Name {
+			// If the child policy name is differet, remove from balancer group
+			// and re-add.
+			w.stateAggregator.Remove(name)
+			w.bg.Remove(name)
+			w.stateAggregator.Add(name, newT.Weight)
+			w.bg.Add(name, balancer.Get(newT.ChildPolicy.Name))
+			// Trigger a state/picker update, because we don't want `ClientConn`
+			// to pick this sub-balancer anymore.
+			rebuildStateAndPicker = true
 		} else if newT.Weight != oldT.Weight {
 			// If this is an existing sub-balancer, update weight if necessary.
 			w.stateAggregator.UpdateWeight(name, newT.Weight)

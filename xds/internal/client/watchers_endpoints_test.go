@@ -1,3 +1,5 @@
+// +build go1.12
+
 /*
  *
  * Copyright 2020 gRPC authors.
@@ -81,13 +83,13 @@ func (s) TestEndpointsWatch(t *testing.T) {
 	}
 
 	wantUpdate := EndpointsUpdate{Localities: []Locality{testLocalities[0]}}
-	client.NewEndpoints(map[string]EndpointsUpdate{testCDSName: wantUpdate})
+	client.NewEndpoints(map[string]EndpointsUpdate{testCDSName: wantUpdate}, UpdateMetadata{})
 	if err := verifyEndpointsUpdate(ctx, endpointsUpdateCh, wantUpdate); err != nil {
 		t.Fatal(err)
 	}
 
 	// Another update for a different resource name.
-	client.NewEndpoints(map[string]EndpointsUpdate{"randomName": {}})
+	client.NewEndpoints(map[string]EndpointsUpdate{"randomName": {}}, UpdateMetadata{})
 	sCtx, sCancel := context.WithTimeout(ctx, defaultTestShortTimeout)
 	defer sCancel()
 	if u, err := endpointsUpdateCh.Receive(sCtx); err != context.DeadlineExceeded {
@@ -96,7 +98,7 @@ func (s) TestEndpointsWatch(t *testing.T) {
 
 	// Cancel watch, and send update again.
 	cancelWatch()
-	client.NewEndpoints(map[string]EndpointsUpdate{testCDSName: wantUpdate})
+	client.NewEndpoints(map[string]EndpointsUpdate{testCDSName: wantUpdate}, UpdateMetadata{})
 	sCtx, sCancel = context.WithTimeout(ctx, defaultTestShortTimeout)
 	defer sCancel()
 	if u, err := endpointsUpdateCh.Receive(sCtx); err != context.DeadlineExceeded {
@@ -146,7 +148,7 @@ func (s) TestEndpointsTwoWatchSameResourceName(t *testing.T) {
 	}
 
 	wantUpdate := EndpointsUpdate{Localities: []Locality{testLocalities[0]}}
-	client.NewEndpoints(map[string]EndpointsUpdate{testCDSName: wantUpdate})
+	client.NewEndpoints(map[string]EndpointsUpdate{testCDSName: wantUpdate}, UpdateMetadata{})
 	for i := 0; i < count; i++ {
 		if err := verifyEndpointsUpdate(ctx, endpointsUpdateChs[i], wantUpdate); err != nil {
 			t.Fatal(err)
@@ -155,7 +157,7 @@ func (s) TestEndpointsTwoWatchSameResourceName(t *testing.T) {
 
 	// Cancel the last watch, and send update again.
 	cancelLastWatch()
-	client.NewEndpoints(map[string]EndpointsUpdate{testCDSName: wantUpdate})
+	client.NewEndpoints(map[string]EndpointsUpdate{testCDSName: wantUpdate}, UpdateMetadata{})
 	for i := 0; i < count-1; i++ {
 		if err := verifyEndpointsUpdate(ctx, endpointsUpdateChs[i], wantUpdate); err != nil {
 			t.Fatal(err)
@@ -222,7 +224,7 @@ func (s) TestEndpointsThreeWatchDifferentResourceName(t *testing.T) {
 	client.NewEndpoints(map[string]EndpointsUpdate{
 		testCDSName + "1": wantUpdate1,
 		testCDSName + "2": wantUpdate2,
-	})
+	}, UpdateMetadata{})
 
 	for i := 0; i < count; i++ {
 		if err := verifyEndpointsUpdate(ctx, endpointsUpdateChs[i], wantUpdate1); err != nil {
@@ -263,7 +265,7 @@ func (s) TestEndpointsWatchAfterCache(t *testing.T) {
 	}
 
 	wantUpdate := EndpointsUpdate{Localities: []Locality{testLocalities[0]}}
-	client.NewEndpoints(map[string]EndpointsUpdate{testCDSName: wantUpdate})
+	client.NewEndpoints(map[string]EndpointsUpdate{testCDSName: wantUpdate}, UpdateMetadata{})
 	if err := verifyEndpointsUpdate(ctx, endpointsUpdateCh, wantUpdate); err != nil {
 		t.Fatal(err)
 	}

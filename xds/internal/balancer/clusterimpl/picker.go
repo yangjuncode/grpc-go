@@ -28,7 +28,9 @@ import (
 	"google.golang.org/grpc/xds/internal/client/load"
 )
 
-var newRandomWRR = wrr.NewRandom
+// NewRandomWRR is used when calculating drops. It's exported so that tests can
+// override it.
+var NewRandomWRR = wrr.NewRandom
 
 const million = 1000000
 
@@ -47,8 +49,8 @@ func gcd(a, b uint32) uint32 {
 	return a
 }
 
-func newDropper(c dropCategory) *dropper {
-	w := newRandomWRR()
+func newDropper(c DropConfig) *dropper {
+	w := NewRandomWRR()
 	gcdv := gcd(c.RequestsPerMillion, million)
 	// Return true for RequestPerMillion, false for the rest.
 	w.Add(true, int64(c.RequestsPerMillion/gcdv))

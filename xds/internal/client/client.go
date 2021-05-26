@@ -16,22 +16,26 @@
  *
  */
 
-// Package client implementation a full fledged gRPC client for the xDS API
-// used by the xds resolver and balancer implementations.
+// Package client implements a full fledged gRPC client for the xDS API used by
+// the xds resolver and balancer implementations.
 package client
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"sync"
 	"time"
 
 	v2corepb "github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
 	v3corepb "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
 
+	"google.golang.org/grpc/internal/xds/matcher"
 	"google.golang.org/grpc/xds/internal/client/load"
+	"google.golang.org/grpc/xds/internal/httpfilter"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/internal/backoff"
@@ -129,14 +133,61 @@ type loadReportingOptions struct {
 // resource updates from an APIClient for a specific version.
 type UpdateHandler interface {
 	// NewListeners handles updates to xDS listener resources.
-	NewListeners(map[string]ListenerUpdate)
+	NewListeners(map[string]ListenerUpdate, UpdateMetadata)
 	// NewRouteConfigs handles updates to xDS RouteConfiguration resources.
-	NewRouteConfigs(map[string]RouteConfigUpdate)
+	NewRouteConfigs(map[string]RouteConfigUpdate, UpdateMetadata)
 	// NewClusters handles updates to xDS Cluster resources.
-	NewClusters(map[string]ClusterUpdate)
+	NewClusters(map[string]ClusterUpdate, UpdateMetadata)
 	// NewEndpoints handles updates to xDS ClusterLoadAssignment (or tersely
 	// referred to as Endpoints) resources.
-	NewEndpoints(map[string]EndpointsUpdate)
+	NewEndpoints(map[string]EndpointsUpdate, UpdateMetadata)
+}
+
+// ServiceStatus is the status of the update.
+type ServiceStatus int
+
+const (
+	// ServiceStatusUnknown is the default state, before a watch is started for
+	// the resource.
+	ServiceStatusUnknown ServiceStatus = iota
+	// ServiceStatusRequested is when the watch is started, but before and
+	// response is received.
+	ServiceStatusRequested
+	// ServiceStatusNotExist is when the resource doesn't exist in
+	// state-of-the-world responses (e.g. LDS and CDS), which means the resource
+	// is removed by the management server.
+	ServiceStatusNotExist // Resource is removed in the server, in LDS/CDS.
+	// ServiceStatusACKed is when the resource is ACKed.
+	ServiceStatusACKed
+	// ServiceStatusNACKed is when the resource is NACKed.
+	ServiceStatusNACKed
+)
+
+// UpdateErrorMetadata is part of UpdateMetadata. It contains the error state
+// when a response is NACKed.
+type UpdateErrorMetadata struct {
+	// Version is the version of the NACKed response.
+	Version string
+	// Err contains why the response was NACKed.
+	Err error
+	// Timestamp is when the NACKed response was received.
+	Timestamp time.Time
+}
+
+// UpdateMetadata contains the metadata for each update, including timestamp,
+// raw message, and so on.
+type UpdateMetadata struct {
+	// Status is the status of this resource, e.g. ACKed, NACKed, or
+	// Not_exist(removed).
+	Status ServiceStatus
+	// Version is the version of the xds response. Note that this is the version
+	// of the resource in use (previous ACKed). If a response is NACKed, the
+	// NACKed version is in ErrState.
+	Version string
+	// Timestamp is when the response is received.
+	Timestamp time.Time
+	// ErrState is set when the update is NACKed.
+	ErrState *UpdateErrorMetadata
 }
 
 // ListenerUpdate contains information received in an LDS response, which is of
@@ -144,23 +195,62 @@ type UpdateHandler interface {
 type ListenerUpdate struct {
 	// RouteConfigName is the route configuration name corresponding to the
 	// target which is being watched through LDS.
+	//
+	// Only one of RouteConfigName and InlineRouteConfig is set.
 	RouteConfigName string
-	// SecurityCfg contains security configuration sent by the control plane.
-	SecurityCfg *SecurityConfig
+	// InlineRouteConfig is the inline route configuration (RDS response)
+	// returned inside LDS.
+	//
+	// Only one of RouteConfigName and InlineRouteConfig is set.
+	InlineRouteConfig *RouteConfigUpdate
+
 	// MaxStreamDuration contains the HTTP connection manager's
 	// common_http_protocol_options.max_stream_duration field, or zero if
 	// unset.
 	MaxStreamDuration time.Duration
+	// HTTPFilters is a list of HTTP filters (name, config) from the LDS
+	// response.
+	HTTPFilters []HTTPFilter
+	// InboundListenerCfg contains inbound listener configuration.
+	InboundListenerCfg *InboundListenerConfig
+
+	// Raw is the resource from the xds response.
+	Raw *anypb.Any
 }
 
-func (lu *ListenerUpdate) String() string {
-	return fmt.Sprintf("{RouteConfigName: %q, SecurityConfig: %+v", lu.RouteConfigName, lu.SecurityCfg)
+// HTTPFilter represents one HTTP filter from an LDS response's HTTP connection
+// manager field.
+type HTTPFilter struct {
+	// Name is an arbitrary name of the filter.  Used for applying override
+	// settings in virtual host / route / weighted cluster configuration (not
+	// yet supported).
+	Name string
+	// Filter is the HTTP filter found in the registry for the config type.
+	Filter httpfilter.Filter
+	// Config contains the filter's configuration
+	Config httpfilter.FilterConfig
+}
+
+// InboundListenerConfig contains information about the inbound listener, i.e
+// the server-side listener.
+type InboundListenerConfig struct {
+	// Address is the local address on which the inbound listener is expected to
+	// accept incoming connections.
+	Address string
+	// Port is the local port on which the inbound listener is expected to
+	// accept incoming connections.
+	Port string
+	// FilterChains is the list of filter chains associated with this listener.
+	FilterChains *FilterChainManager
 }
 
 // RouteConfigUpdate contains information received in an RDS response, which is
 // of interest to the registered RDS watcher.
 type RouteConfigUpdate struct {
 	VirtualHosts []*VirtualHost
+
+	// Raw is the resource from the xds response.
+	Raw *anypb.Any
 }
 
 // VirtualHost contains the routes for a list of Domains.
@@ -172,12 +262,19 @@ type VirtualHost struct {
 	// Routes contains a list of routes, each containing matchers and
 	// corresponding action.
 	Routes []*Route
+	// HTTPFilterConfigOverride contains any HTTP filter config overrides for
+	// the virtual host which may be present.  An individual filter's override
+	// may be unused if the matching Route contains an override for that
+	// filter.
+	HTTPFilterConfigOverride map[string]httpfilter.FilterConfig
 }
 
 // Route is both a specification of how to match a request as well as an
 // indication of the action to take upon match.
 type Route struct {
-	Path, Prefix, Regex *string
+	Path   *string
+	Prefix *string
+	Regex  *regexp.Regexp
 	// Indicates if prefix/path matching should be case insensitive. The default
 	// is false (case sensitive).
 	CaseInsensitive bool
@@ -185,31 +282,45 @@ type Route struct {
 	Fraction        *uint32
 
 	// If the matchers above indicate a match, the below configuration is used.
-	Action map[string]uint32 // action is weighted clusters.
+	WeightedClusters map[string]WeightedCluster
 	// If MaxStreamDuration is nil, it indicates neither of the route action's
 	// max_stream_duration fields (grpc_timeout_header_max nor
 	// max_stream_duration) were set.  In this case, the ListenerUpdate's
 	// MaxStreamDuration field should be used.  If MaxStreamDuration is set to
 	// an explicit zero duration, the application's deadline should be used.
 	MaxStreamDuration *time.Duration
+	// HTTPFilterConfigOverride contains any HTTP filter config overrides for
+	// the route which may be present.  An individual filter's override may be
+	// unused if the matching WeightedCluster contains an override for that
+	// filter.
+	HTTPFilterConfigOverride map[string]httpfilter.FilterConfig
+}
+
+// WeightedCluster contains settings for an xds RouteAction.WeightedCluster.
+type WeightedCluster struct {
+	// Weight is the relative weight of the cluster.  It will never be zero.
+	Weight uint32
+	// HTTPFilterConfigOverride contains any HTTP filter config overrides for
+	// the weighted cluster which may be present.
+	HTTPFilterConfigOverride map[string]httpfilter.FilterConfig
 }
 
 // HeaderMatcher represents header matchers.
 type HeaderMatcher struct {
-	Name         string      `json:"name"`
-	InvertMatch  *bool       `json:"invertMatch,omitempty"`
-	ExactMatch   *string     `json:"exactMatch,omitempty"`
-	RegexMatch   *string     `json:"regexMatch,omitempty"`
-	PrefixMatch  *string     `json:"prefixMatch,omitempty"`
-	SuffixMatch  *string     `json:"suffixMatch,omitempty"`
-	RangeMatch   *Int64Range `json:"rangeMatch,omitempty"`
-	PresentMatch *bool       `json:"presentMatch,omitempty"`
+	Name         string
+	InvertMatch  *bool
+	ExactMatch   *string
+	RegexMatch   *regexp.Regexp
+	PrefixMatch  *string
+	SuffixMatch  *string
+	RangeMatch   *Int64Range
+	PresentMatch *bool
 }
 
 // Int64Range is a range for header range match.
 type Int64Range struct {
-	Start int64 `json:"start"`
-	End   int64 `json:"end"`
+	Start int64
+	End   int64
 }
 
 // SecurityConfig contains the security configuration received as part of the
@@ -232,29 +343,61 @@ type SecurityConfig struct {
 	// IdentityCertName is the certificate name to be passed to the plugin
 	// (looked up from the bootstrap file) while fetching identity certificates.
 	IdentityCertName string
-	// AcceptedSANs is a list of Subject Alternative Names. During the TLS
-	// handshake, the SAN present in the peer certificate is compared against
-	// this list, and the handshake succeeds only if a match is found. Used only
-	// on the client-side.
-	AcceptedSANs []string
+	// SubjectAltNameMatchers is an optional list of match criteria for SANs
+	// specified on the peer certificate. Used only on the client-side.
+	//
+	// Some intricacies:
+	// - If this field is empty, then any peer certificate is accepted.
+	// - If the peer certificate contains a wildcard DNS SAN, and an `exact`
+	//   matcher is configured, a wildcard DNS match is performed instead of a
+	//   regular string comparison.
+	SubjectAltNameMatchers []matcher.StringMatcher
 	// RequireClientCert indicates if the server handshake process expects the
 	// client to present a certificate. Set to true when performing mTLS. Used
 	// only on the server-side.
 	RequireClientCert bool
 }
 
+// ClusterType is the type of cluster from a received CDS response.
+type ClusterType int
+
+const (
+	// ClusterTypeEDS represents the EDS cluster type, which will delegate endpoint
+	// discovery to the management server.
+	ClusterTypeEDS ClusterType = iota
+	// ClusterTypeLogicalDNS represents the Logical DNS cluster type, which essentially
+	// maps to the gRPC behavior of using the DNS resolver with pick_first LB policy.
+	ClusterTypeLogicalDNS
+	// ClusterTypeAggregate represents the Aggregate Cluster type, which provides a
+	// prioritized list of clusters to use. It is used for failover between clusters
+	// with a different configuration.
+	ClusterTypeAggregate
+)
+
 // ClusterUpdate contains information from a received CDS response, which is of
 // interest to the registered CDS watcher.
 type ClusterUpdate struct {
-	// ServiceName is the service name corresponding to the clusterName which
-	// is being watched for through CDS.
-	ServiceName string
+	ClusterType ClusterType
+	// ClusterName is the clusterName being watched for through CDS.
+	ClusterName string
+	// EDSServiceName is an optional name for EDS. If it's not set, the balancer
+	// should watch ClusterName for the EDS resources.
+	EDSServiceName string
 	// EnableLRS indicates whether or not load should be reported through LRS.
 	EnableLRS bool
 	// SecurityCfg contains security configuration sent by the control plane.
 	SecurityCfg *SecurityConfig
 	// MaxRequests for circuit breaking, if any (otherwise nil).
 	MaxRequests *uint32
+	// DNSHostName is used only for cluster type DNS. It's the DNS name to
+	// resolve in "host:port" form
+	DNSHostName string
+	// PrioritizedClusterNames is used only for cluster type aggregate. It represents
+	// a prioritized list of cluster names.
+	PrioritizedClusterNames []string
+
+	// Raw is the resource from the xds response.
+	Raw *anypb.Any
 }
 
 // OverloadDropConfig contains the config to drop overloads.
@@ -301,6 +444,9 @@ type Locality struct {
 type EndpointsUpdate struct {
 	Drops      []OverloadDropConfig
 	Localities []Locality
+
+	// Raw is the resource from the xds response.
+	Raw *anypb.Any
 }
 
 // Function to be overridden in tests.
@@ -328,16 +474,27 @@ type clientImpl struct {
 
 	logger *grpclog.PrefixLogger
 
-	updateCh    *buffer.Unbounded // chan *watcherInfoWithUpdate
+	updateCh *buffer.Unbounded // chan *watcherInfoWithUpdate
+	// All the following maps are to keep the updates/metadata in a cache.
+	// TODO: move them to a separate struct/package, to cleanup the xds_client.
+	// And CSDS handler can be implemented directly by the cache.
 	mu          sync.Mutex
 	ldsWatchers map[string]map[*watchInfo]bool
+	ldsVersion  string // Only used in CSDS.
 	ldsCache    map[string]ListenerUpdate
+	ldsMD       map[string]UpdateMetadata
 	rdsWatchers map[string]map[*watchInfo]bool
+	rdsVersion  string // Only used in CSDS.
 	rdsCache    map[string]RouteConfigUpdate
+	rdsMD       map[string]UpdateMetadata
 	cdsWatchers map[string]map[*watchInfo]bool
+	cdsVersion  string // Only used in CSDS.
 	cdsCache    map[string]ClusterUpdate
+	cdsMD       map[string]UpdateMetadata
 	edsWatchers map[string]map[*watchInfo]bool
+	edsVersion  string // Only used in CSDS.
 	edsCache    map[string]EndpointsUpdate
+	edsMD       map[string]UpdateMetadata
 
 	// Changes to map lrsClients and the lrsClient inside the map need to be
 	// protected by lrsMu.
@@ -383,12 +540,16 @@ func newWithConfig(config *bootstrap.Config, watchExpiryTimeout time.Duration) (
 		updateCh:    buffer.NewUnbounded(),
 		ldsWatchers: make(map[string]map[*watchInfo]bool),
 		ldsCache:    make(map[string]ListenerUpdate),
+		ldsMD:       make(map[string]UpdateMetadata),
 		rdsWatchers: make(map[string]map[*watchInfo]bool),
 		rdsCache:    make(map[string]RouteConfigUpdate),
+		rdsMD:       make(map[string]UpdateMetadata),
 		cdsWatchers: make(map[string]map[*watchInfo]bool),
 		cdsCache:    make(map[string]ClusterUpdate),
+		cdsMD:       make(map[string]UpdateMetadata),
 		edsWatchers: make(map[string]map[*watchInfo]bool),
 		edsCache:    make(map[string]EndpointsUpdate),
+		edsMD:       make(map[string]UpdateMetadata),
 		lrsClients:  make(map[string]*lrsClient),
 	}
 
