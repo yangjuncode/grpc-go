@@ -102,6 +102,10 @@ type ClientStream interface {
 	// calling RecvMsg on the same stream at the same time, but it is not
 	// safe to call RecvMsg on the same stream in different goroutines.
 	RecvMsg(m interface{}) error
+
+	SendMsgForward(req []byte) error
+
+	RecvMsgForward() ([]byte, error)
 }
 
 // ClientInterceptor is an interceptor for gRPC client streams.
